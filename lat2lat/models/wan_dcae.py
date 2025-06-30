@@ -75,6 +75,7 @@ class WANDCAEPair(nn.Module):
         x = (x + 1) / 2
         x = x.clamp(0, 1)
         return x.to(self.dtype)
+        
     def preprocess(self, x):
         """
         x: [B,T,C,H,W]
