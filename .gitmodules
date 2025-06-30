@@ -1,3 +1,9 @@
 [submodule "owl-vaes"]
 	path = owl-vaes
 	url = https://github.com/Wayfarer-Labs/owl-vaes.git
+[submodule "main"]
+	path = main
+	url = https://github.com/Wayfarer-Labs/owl-wms.git
+[submodule "owl-wms"]
+	path = owl-wms
+	url = https://github.com/Wayfarer-Labs/owl-wms.git
