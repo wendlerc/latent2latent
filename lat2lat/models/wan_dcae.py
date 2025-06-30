@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
+import sys
+sys.path.append('./owl-vaes')
 from owl_vaes.configs import ResNetConfig
 from owl_vaes.models.dcae import DCAE, is_landscape
 import einops as eo
@@ -13,7 +15,7 @@ class WANDCAEPair(nn.Module):
         vae = AutoencoderKLWan.from_pretrained(
             "Wan-AI/Wan2.1-VACE-14B-diffusers",
             subfolder="vae",
-            torch_dtype=torch.float16  # Optional: use half precision
+            torch_dtype=torch.bfloat16  # Optional: use half precision
         )
         self.wan_vae = vae
         self.wan_vae.decoder = None
@@ -52,6 +54,9 @@ class WANDCAEPair(nn.Module):
         assert self.dcae.training == False, "dcae must be in eval mode, otherwise it returns mean, logvar"
         mean_dcae = self.dcae.encoder(x_dcae)
         mean_dcae = eo.rearrange(mean_dcae, '(b t) c h w -> b t c h w', b=b, t=t)
+        del x_dcae
+        mean_dcae = mean_dcae.cpu()
+        torch.cuda.empty_cache()
         # wan expects [B,C,T,H,W]
         assert x_wan.min() >= -1 and x_wan.max() <= 1, "x_wan must be in [-1,1]"
         x_wan = eo.rearrange(x_wan, 'b t c h w -> b c t h w')
@@ -60,6 +65,9 @@ class WANDCAEPair(nn.Module):
         mean_wan = out.latent_dist.mode()
         mean_wan = eo.rearrange(mean_wan, 'b c t h w -> b t c h w')
         assert mean_wan.shape[1] == 1 + (t-1)//4, "wan does not compress the first frame but then the remaining ones by a factor of 4"
+        del x_wan
+        mean_wan = mean_wan.cpu()
+        torch.cuda.empty_cache()
         return mean_wan, mean_dcae
 
 
@@ -75,14 +83,13 @@ class WANDCAEPair(nn.Module):
         x = (x + 1) / 2
         x = x.clamp(0, 1)
         return x.to(self.dtype)
-        
+
     def preprocess(self, x):
         """
         x: [B,T,C,H,W]
         normalizes x to [-1,1] and for wan squishes landscape to square
         returns x_wan, x_dcae
         """
-        print(x.shape)
         b, t, c, h, w = x.shape
         
         if is_landscape((h, w)):
