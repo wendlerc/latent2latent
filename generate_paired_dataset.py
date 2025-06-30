@@ -175,8 +175,11 @@ class WANDCAEProcessor:
         self.current_shard_samples.append(sample)
         self.current_shard_size_bytes += sample_size
 
-    def get_max_batch_size(self, sequence_length: int = 5, height: int = 360, width: int = 640) -> int:
+    def get_max_batch_size(self, sequence_length: int = None, height: int = 360, width: int = 640) -> int:
         """Determine maximum batch size for given input dimensions."""
+        if sequence_length is None:
+            sequence_length = self.sequence_length  # Use the actual sequence length!
+        
         test_shape = (1, sequence_length, 3, height, width)
         
         batch_size = 1
@@ -190,12 +193,14 @@ class WANDCAEProcessor:
                 torch.cuda.empty_cache()
                 batch_size *= 2
                 if batch_size > 1024:
-                    self.batch_size = 1024
-                    return 1024
+                    optimal_batch_size = max(1, batch_size // 2)
+                    self.batch_size = optimal_batch_size
+                    return optimal_batch_size
             except RuntimeError as e:
                 if 'out of memory' in str(e):
-                    self.batch_size = max(1, batch_size // 2)
-                    return max(1, batch_size // 2)
+                    optimal_batch_size = max(1, batch_size // 2)
+                    self.batch_size = optimal_batch_size
+                    return optimal_batch_size
                 else:
                     raise e
     
@@ -371,7 +376,7 @@ def generate_dataset(
         processors.append(processor)
     
     # Start processing
-    futures = [processor.get_max_batch_size.remote() for processor in processors]
+    futures = [processor.get_max_batch_size.remote(sequence_length) for processor in processors]
     batch_sizes = ray.get(futures)
     logger.info(f"Batch sizes: {batch_sizes}")
     # Start processing on all GPUs
@@ -509,7 +514,7 @@ def test_processing(
             processors.append(processor)
         
         # Start processing
-        futures = [processor.get_max_batch_size.remote() for processor in processors]
+        futures = [processor.get_max_batch_size.remote(5) for processor in processors]
         batch_sizes = ray.get(futures)
         logger.info(f"Batch sizes: {batch_sizes}")
 
