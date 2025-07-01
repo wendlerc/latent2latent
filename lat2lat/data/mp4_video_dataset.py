@@ -175,7 +175,7 @@ class MP4VideoDataset(IterableDataset):
             out_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             out_path = out_file.name
             out_file.close()
-            
+            """
             ffmpeg_cmd = [
                 'ffmpeg', '-y',
                 '-ss', str(start),
@@ -188,7 +188,21 @@ class MP4VideoDataset(IterableDataset):
                 '-avoid_negative_ts', 'make_zero',
                 out_path
             ]
-            
+            """
+            ffmpeg_cmd = [
+                'ffmpeg', '-y',  # overwrite output
+                '-ss', str(start),  # seek to start time
+                '-i', presigned_url,  # input from S3
+                '-t', str(self.crop_duration),  # duration
+                '-c:v', 'libx264',  # video codec
+                '-c:a', 'aac',  # audio codec
+                '-r', '30',  # Force 30 FPS for consistent frame counts
+                '-err_detect', 'ignore_err',
+                '-fflags', '+igndts',
+                '-movflags', '+frag_keyframe+empty_moov',
+                '-avoid_negative_ts', 'make_zero',  # handle timing issues
+                out_path
+            ]
             result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 logger.warning(f"ffmpeg failed for {key}: {result.stderr}")
@@ -430,6 +444,9 @@ if __name__ == "__main__":
     
     logger.info("⏱️  Loading 5 batches for timing analysis...")
     
+    import os
+    os.makedirs('/home/developer/workspace/data/pt', exist_ok=True)
+    
     timings = []
     for i in range(20):
         start_time = time.time()
@@ -437,6 +454,10 @@ if __name__ == "__main__":
         batch_time = time.time() - start_time
         timings.append(batch_time)
         logger.info(f"Batch {i+1}/20: {batch_time:.2f}s")
+        
+        # Save batch as .pt file
+        torch.save(batch, f'/home/developer/workspace/data/pt/{i:04d}.pt')
+        logger.info(f"Saved batch {i+1}/20 to /home/developer/workspace/data/pt/{i:04d}.pt")
     
     avg_time = sum(timings) / len(timings)
     min_time = min(timings)
