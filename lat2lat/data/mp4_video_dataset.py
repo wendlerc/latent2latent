@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torchvision import transforms
 from torchvision.io import read_video
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv("/home/developer/workspace/.env2")
 
@@ -85,6 +86,19 @@ class MP4VideoDataset(IterableDataset):
         self.video_queue = RandomizedQueue()  # Queue of video file paths
         self.tensor_queue = RandomizedQueue()  # Queue of processed tensors
         
+        # Thread pool for concurrent video extraction
+        self.video_extractor_pool = ThreadPoolExecutor(max_workers=max_videos_queue, thread_name_prefix="VideoExtractor")
+        self.pending_extractions = 0  # Track pending extraction tasks
+        self.extraction_lock = threading.Lock()  # Lock for pending_extractions counter
+        
+        # Thread pool for concurrent tensor processing
+        self.tensor_processor_pool = ThreadPoolExecutor(max_workers=max_videos_queue, thread_name_prefix="TensorProcessor")
+        self.pending_tensor_processing = 0  # Track pending tensor processing tasks
+        self.tensor_processing_lock = threading.Lock()  # Lock for pending_tensor_processing counter
+        
+        # Shutdown flag for graceful cleanup
+        self.shutdown_flag = threading.Event()
+        
         # Get available MP4 keys once at startup
         self.available_keys = self._get_all_keys()
         logger.info(f"Found {len(self.available_keys)} MP4 files in bucket")
@@ -95,7 +109,7 @@ class MP4VideoDataset(IterableDataset):
         self.video_thread.start()
         self.tensor_thread.start()
         
-        logger.info(f"MP4VideoDataset initialized for rank {rank}/{world_size}")
+        logger.info(f"MP4VideoDataset initialized for rank {rank}/{world_size} with {max_videos_queue} concurrent video extractors and {max_videos_queue} concurrent tensor processors")
 
     def _get_fs(self):
         kwargs = {
@@ -128,6 +142,7 @@ class MP4VideoDataset(IterableDataset):
         return keys
 
     def _extract_video_crop(self, key):
+        logger.info(f"Extracting video crop for {key}")
         """Extract a video crop using ffmpeg directly with S3 presigned URL"""
         try:
             # Generate presigned URL
@@ -189,57 +204,104 @@ class MP4VideoDataset(IterableDataset):
             logger.error(f"Error extracting crop from {key}: {e}")
             return None
 
-    def _background_extract_videos(self):
-        """Background thread to extract video crops"""
-        while True:
+    def _on_extraction_complete(self, future):
+        """Callback for when a video extraction task completes"""
+        try:
+            video_path = future.result()
+            if video_path:
+                self.video_queue.add(video_path)
+                logger.debug(f"Added video to queue: {video_path}")
+        except Exception as e:
+            logger.error(f"Video extraction failed: {e}")
+        finally:
+            # Decrement pending extractions counter
+            with self.extraction_lock:
+                self.pending_extractions -= 1
+
+    def _on_tensor_processing_complete(self, future):
+        """Callback for when a tensor processing task completes"""
+        try:
+            tensors, video_path = future.result()
+            
+            # Clean up video file
             try:
-                if self.video_queue.size() < self.max_videos_queue:
+                if video_path:
+                    os.unlink(video_path)
+            except:
+                pass
+            
+            if tensors is not None:
+                for tensor in tensors:
+                    if tensor is not None:
+                        self.tensor_queue.add(tensor)
+                        logger.debug(f"Added tensor to queue, shape: {tensor.shape}")
+                        
+                        # Check if tensor queue is getting full
+                        if self.tensor_queue.size() >= self.max_tensors_queue:
+                            break
+        except Exception as e:
+            logger.error(f"Tensor processing failed: {e}")
+        finally:
+            # Decrement pending tensor processing counter
+            with self.tensor_processing_lock:
+                self.pending_tensor_processing -= 1
+
+    def _background_extract_videos(self):
+        """Background thread to manage concurrent video extractions"""
+        while not self.shutdown_flag.is_set():
+            try:
+                # Check if we need more videos and can start more extractions
+                with self.extraction_lock:
+                    current_total = self.video_queue.size() + self.pending_extractions
+                
+                if current_total < self.max_videos_queue:
                     # Pick a random key
                     key = random.choice(self.available_keys)
                     
-                    # Extract video crop
-                    video_path = self._extract_video_crop(key)
-                    if video_path:
-                        self.video_queue.add(video_path)
-                        logger.debug(f"Added video to queue: {video_path}")
+                    # Submit extraction task to thread pool
+                    with self.extraction_lock:
+                        self.pending_extractions += 1
+                    
+                    future = self.video_extractor_pool.submit(self._extract_video_crop, key)
+                    future.add_done_callback(self._on_extraction_complete)
+                    
+                    logger.debug(f"Submitted extraction task for {key}, pending: {self.pending_extractions}")
                 else:
                     time.sleep(1)
             except Exception as e:
-                logger.error(f"Error in background video extraction: {e}")
+                if not self.shutdown_flag.is_set():  # Only log if not shutting down
+                    logger.error(f"Error in background video extraction management: {e}")
                 time.sleep(5)
 
     def _background_process_videos(self):
-        """Background thread to process videos into tensors"""
-        while True:
+        """Background thread to manage concurrent tensor processing"""
+        while not self.shutdown_flag.is_set():
             try:
-                if self.tensor_queue.size() < self.max_tensors_queue:
+                # Check if we need more tensor processing and can start more tasks
+                with self.tensor_processing_lock:
+                    current_processing = self.pending_tensor_processing
+                
+                if (self.tensor_queue.size() < self.max_tensors_queue and 
+                    current_processing < self.max_videos_queue):
+                    
                     video_path = self.video_queue.pop()
                     if video_path is None:
                         time.sleep(1)
                         continue
                     
-                    # Process video into tensor
-                    tensors = self._process_video_to_tensor(video_path)
+                    # Submit tensor processing task to thread pool
+                    with self.tensor_processing_lock:
+                        self.pending_tensor_processing += 1
                     
-                    # Clean up video file
-                    try:
-                        os.unlink(video_path)
-                    except:
-                        pass
+                    future = self.tensor_processor_pool.submit(self._process_video_to_tensor_with_path, video_path)
+                    future.add_done_callback(self._on_tensor_processing_complete)
                     
-                    if tensors is not None:
-                        for tensor in tensors:
-                            if tensor is not None:
-                                self.tensor_queue.add(tensor)
-                                logger.debug(f"Added tensor to queue, shape: {tensor.shape}")
-                                
-                                # Check if tensor queue is getting full
-                                if self.tensor_queue.size() >= self.max_tensors_queue:
-                                    break
+                    logger.debug(f"Submitted tensor processing task for {video_path}, pending: {current_processing + 1}")
                 else:
                     time.sleep(1)
             except Exception as e:
-                logger.error(f"Error in background video processing: {e}")
+                if not self.shutdown_flag.is_set():  # Only log if not shutting down
+                    logger.error(f"Error in background tensor processing management: {e}")
                 time.sleep(5)
 
     def _process_video_to_tensor(self, video_path):
@@ -296,6 +358,11 @@ class MP4VideoDataset(IterableDataset):
             logger.error(f"Error processing video {video_path}: {e}")
             return None
 
+    def _process_video_to_tensor_with_path(self, video_path):
+        """Wrapper to process video and return both tensors and path for cleanup"""
+        tensors = self._process_video_to_tensor(video_path)
+        return tensors, video_path
+
     def __iter__(self):
         """Iterator that yields video tensors"""
         while True:
@@ -304,6 +371,31 @@ class MP4VideoDataset(IterableDataset):
                 yield tensor
             else:
                 time.sleep(0.1)
+
+    def cleanup(self):
+        """Clean up resources including thread pools"""
+        # Signal background threads to stop
+        if hasattr(self, 'shutdown_flag'):
+            self.shutdown_flag.set()
+            logger.info("Shutdown flag set, waiting for background threads to stop...")
+            time.sleep(2)  # Give threads time to notice and exit gracefully
+        
+        if hasattr(self, 'video_extractor_pool'):
+            logger.info("Shutting down video extractor thread pool...")
+            self.video_extractor_pool.shutdown(wait=True)
+            logger.info("Video extractor thread pool shut down successfully")
+        
+        if hasattr(self, 'tensor_processor_pool'):
+            logger.info("Shutting down tensor processor thread pool...")
+            self.tensor_processor_pool.shutdown(wait=True)
+            logger.info("Tensor processor thread pool shut down successfully")
+
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        try:
+            self.cleanup()
+        except:
+            pass  # Ignore errors during cleanup in destructor
 
 def collate_fn(batch):
     """Collate function to stack video tensors"""
@@ -326,17 +418,17 @@ if __name__ == "__main__":
     logger.info("🚀 Testing MP4VideoDataset with multi-sample extraction")
     
     loader = get_video_loader(
-        batch_size=10,  # Reduced since we get more samples per video
+        batch_size=1,  # Reduced since we get more samples per video
         bucket_name='cod-yt-playlist',
         frames_per_sample=101,
         target_height=360,
         target_width=640,
-        crop_duration=11,
-        max_videos_queue=3,  # Fewer videos needed
-        max_tensors_queue=30  # More tensors per video
+        crop_duration=10.2,
+        max_videos_queue=6,  # Fewer videos needed
+        max_tensors_queue=(61*30)//101 # More tensors per video
     )
     
-    logger.info("⏱️  Loading 20 batches for timing analysis...")
+    logger.info("⏱️  Loading 5 batches for timing analysis...")
     
     timings = []
     for i in range(20):
