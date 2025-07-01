@@ -3,4 +3,9 @@ ray
 webdataset 
 typer 
 numpyencoder 
-fsspec
+fsspec[s3]
+moviepy
+python-dotenv
+s3fs
+av
+torchcodec
