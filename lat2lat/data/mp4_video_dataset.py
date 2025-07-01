@@ -148,11 +148,11 @@ class MP4VideoDataset(IterableDataset):
             # Generate presigned URL
             presigned_url = self.fs.url(key, expires=3600)
             
-            # Get video duration using ffprobe
+            # Get video duration and color space info using ffprobe
             probe_cmd = [
                 'ffprobe', '-v', 'quiet',
                 '-print_format', 'json',
-                '-show_format',
+                '-show_format', '-show_streams',
                 presigned_url
             ]
             
@@ -163,6 +163,15 @@ class MP4VideoDataset(IterableDataset):
                 
             info = json.loads(result.stdout)
             duration = float(info.get('format', {}).get('duration', 0))
+            
+            # Extract color space info and use it for FFmpeg
+            video_stream = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), {})
+            color_space = video_stream.get('color_space', 'bt2020nc')  # Default to high quality bt2020nc
+            color_range = video_stream.get('color_range', 'pc')   
+            color_primaries = video_stream.get('color_primaries', 'bt2020')  # Default to high quality bt2020
+            color_trc = video_stream.get('color_trc', 'smpte2084')  # Default to high quality PQ
+            
+            logger.info(f"Using color info - space: {color_space}, range: {color_range}, primaries: {color_primaries}")
             
             if duration <= self.crop_duration:
                 logger.warning(f"Video too short ({duration:.2f}s) for {self.crop_duration}s crop: {key}")
@@ -176,6 +185,16 @@ class MP4VideoDataset(IterableDataset):
             out_path = out_file.name
             out_file.close()
             
+            # Map range values (FFmpeg uses different names than probe output)
+            range_mapping = {
+                'tv': 'tv',      # Limited range (16-235)
+                'pc': 'pc',      # Full range (0-255)  
+                'limited': 'tv',
+                'full': 'pc',
+                'unknown': 'pc'  # Default to full range for safety
+            }
+            output_range = range_mapping.get(color_range, 'pc')  # Default to full range for high quality
+            output_range = 'pc'
             ffmpeg_cmd = [
                 'ffmpeg', '-y',  # overwrite output
                 '-ss', str(start),  # seek to start time
@@ -184,6 +203,14 @@ class MP4VideoDataset(IterableDataset):
                 '-c:v', 'libx264',  # video codec
                 '-c:a', 'aac',  # audio codec
                 '-r', '30',  # Force 30 FPS for consistent frame counts
+                # Use detected color space settings to preserve original appearance
+                '-colorspace', color_space,
+                '-color_primaries', color_primaries,
+                '-color_trc', color_trc,
+                '-color_range', output_range,
+                '-vf', f'scale={self.target_width}:{self.target_height}:in_color_matrix={color_space}:in_range={output_range}:out_color_matrix={color_space}:out_range={output_range}',
+                '-crf', '18',  # High quality to minimize artifacts
+                '-preset', 'fast',  # Balance speed vs quality
                 '-err_detect', 'ignore_err',
                 '-fflags', '+igndts',
                 '-movflags', '+frag_keyframe+empty_moov',
@@ -321,8 +348,7 @@ class MP4VideoDataset(IterableDataset):
             logger.info(f"Video tensor min: {video_tensor.min()}, max: {video_tensor.max()}, dtype: {video_tensor.dtype}")
             
             # Keep as uint8 for memory efficiency - no normalization
-            # Apply transforms (resize) - works with uint8
-            video_tensor = self.transform(video_tensor)
+            # No transforms needed - FFmpeg already resized to target dimensions
             
             # Calculate how many complete samples we can extract
             total_frames = video_tensor.shape[0]
