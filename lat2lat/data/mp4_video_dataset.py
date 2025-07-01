@@ -175,20 +175,7 @@ class MP4VideoDataset(IterableDataset):
             out_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
             out_path = out_file.name
             out_file.close()
-            """
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-ss', str(start),
-                '-i', presigned_url,
-                '-t', str(self.crop_duration),
-                '-c:v', 'libx264',
-                '-c:a', 'aac',
-                '-r', '30',  # Force 30 FPS for consistent frame counts
-                '-pix_fmt', 'yuv420p',
-                '-avoid_negative_ts', 'make_zero',
-                out_path
-            ]
-            """
+            
             ffmpeg_cmd = [
                 'ffmpeg', '-y',  # overwrite output
                 '-ss', str(start),  # seek to start time
