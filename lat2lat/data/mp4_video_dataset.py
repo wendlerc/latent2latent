@@ -56,6 +56,8 @@ class MP4VideoDataset(IterableDataset):
                  target_height=360,
                  target_width=640,
                  crop_duration=10,
+                 from_time=None,
+                 to_time=None,
                  max_videos_queue=5,
                  max_tensors_queue=50,
                  rank=0, 
@@ -68,6 +70,8 @@ class MP4VideoDataset(IterableDataset):
         self.target_height = target_height
         self.target_width = target_width
         self.crop_duration = crop_duration
+        self.from_time = from_time  # Start time in seconds (None = start from beginning)
+        self.to_time = to_time      # End time in seconds (None = go to end)
         self.max_videos_queue = max_videos_queue
         self.max_tensors_queue = max_tensors_queue
         self.rank = rank
@@ -110,6 +114,12 @@ class MP4VideoDataset(IterableDataset):
         self.tensor_thread.start()
         
         logger.info(f"MP4VideoDataset initialized for rank {rank}/{world_size} with {max_videos_queue} concurrent video extractors and {max_videos_queue} concurrent tensor processors")
+        
+        # Log time range constraints if specified
+        if self.from_time is not None or self.to_time is not None:
+            from_str = f"{self.from_time:.1f}s" if self.from_time is not None else "start"
+            to_str = f"{self.to_time:.1f}s" if self.to_time is not None else "end"
+            logger.info(f"Time range constraints: sampling from {from_str} to {to_str}")
 
     def _get_fs(self):
         kwargs = {
@@ -177,8 +187,21 @@ class MP4VideoDataset(IterableDataset):
                 logger.warning(f"Video too short ({duration:.2f}s) for {self.crop_duration}s crop: {key}")
                 return None
             
-            # Choose random start time
-            start = random.uniform(0, duration - self.crop_duration)
+            # Determine valid time range for sampling
+            min_start = self.from_time if self.from_time is not None else 0
+            max_end = self.to_time if self.to_time is not None else duration
+            
+            # Ensure we have enough duration for the crop within the specified range
+            available_duration = max_end - min_start
+            if available_duration < self.crop_duration:
+                logger.warning(f"Insufficient duration ({available_duration:.2f}s) in time range [{min_start:.1f}, {max_end:.1f}] for {self.crop_duration}s crop: {key}")
+                return None
+            
+            # Choose random start time within the constrained range
+            max_start = max_end - self.crop_duration
+            start = random.uniform(min_start, max_start)
+            
+            logger.debug(f"Video duration: {duration:.2f}s, sampling from [{min_start:.1f}, {max_end:.1f}], start: {start:.2f}s")
             
             # Extract clip using ffmpeg
             out_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
@@ -428,8 +451,15 @@ def collate_fn(batch):
     """Collate function to stack video tensors"""
     return torch.stack(batch)
 
-def get_video_loader(batch_size=4, **dataset_kwargs):
-    """Create a DataLoader for MP4 videos"""
+def get_video_loader(batch_size=4, from_time=None, to_time=None, **dataset_kwargs):
+    """Create a DataLoader for MP4 videos
+    
+    Args:
+        batch_size: Batch size for the DataLoader
+        from_time: Start time in seconds for video sampling (None = start from beginning)
+        to_time: End time in seconds for video sampling (None = go to end)
+        **dataset_kwargs: Additional arguments passed to MP4VideoDataset
+    """
     if dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -437,12 +467,28 @@ def get_video_loader(batch_size=4, **dataset_kwargs):
         rank = 0
         world_size = 1
 
-    dataset = MP4VideoDataset(rank=rank, world_size=world_size, **dataset_kwargs)
+    dataset = MP4VideoDataset(
+        rank=rank, 
+        world_size=world_size, 
+        from_time=from_time,
+        to_time=to_time,
+        **dataset_kwargs
+    )
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
 if __name__ == "__main__":
     # Test the dataset
     logger.info("🚀 Testing MP4VideoDataset with multi-sample extraction")
+    
+    # Example usage for creating different data splits:
+    # Validation set: sample from 0 to 10 minutes
+    # val_loader = get_video_loader(batch_size=1, from_time=0, to_time=10*60, ...)
+    # 
+    # Test set: sample from 10 to 20 minutes  
+    # test_loader = get_video_loader(batch_size=1, from_time=10*60, to_time=20*60, ...)
+    #
+    # Train set: sample from 20 minutes to end
+    # train_loader = get_video_loader(batch_size=1, from_time=20*60, to_time=None, ...)
     
     loader = get_video_loader(
         batch_size=1,  # Reduced since we get more samples per video
