@@ -2,6 +2,9 @@
 """
 Video dataset organization script using MP4VideoDataset.
 Organizes video tensors into train/valid/test splits based on time ranges.
+
+The dataloader will block when the upload queue is full, ensuring no data is lost
+and the download rate is automatically throttled by the upload capacity.
 """
 
 import torch
@@ -33,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Global upload queue and worker thread
-MAX_QUEUE_SIZE = 100  # Increased queue size to allow more buffering
+MAX_QUEUE_SIZE = 100  # Queue size - dataloader will block when full to prevent data loss
 upload_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 upload_pool = None
 stop_event = Event()
@@ -182,13 +185,12 @@ def save_tensor(fs, tensor: torch.Tensor, file_path: str, frames_per_sample=101,
         # Ensure upload pool is running
         ensure_upload_pool(frames_per_sample=frames_per_sample, crop_duration=crop_duration)
         
-        # Try to add to upload queue with timeout
-        max_retries = 3
-        retry_count = 0
-        while retry_count < max_retries:
+        # Block until there's space in the upload queue
+        # This ensures the dataloader waits when uploads are slow
+        while True:
             try:
-                # If queue is full, wait up to 30 seconds
-                upload_queue.put((fs, buffer, file_path), timeout=30)
+                # Block indefinitely until there's space in the queue
+                upload_queue.put((fs, buffer, file_path), block=True, timeout=None)
                 
                 # Free memory immediately after queuing
                 del tensor
@@ -196,14 +198,10 @@ def save_tensor(fs, tensor: torch.Tensor, file_path: str, frames_per_sample=101,
                 
                 return True
             except Full:
-                retry_count += 1
-                if retry_count < max_retries:
-                    logger.warning(f"Upload queue full, retrying in 10 seconds... (attempt {retry_count}/{max_retries})")
-                    time.sleep(10)  # Reduced wait time to keep things moving
-                else:
-                    logger.error(f"Upload queue full after {max_retries} retries, could not save tensor to {file_path}")
-                    buffer.close()
-                    return False
+                # This should never happen with block=True and timeout=None,
+                # but just in case, log and continue waiting
+                logger.debug(f"Upload queue full, waiting for space... (queue size: {upload_queue.qsize()})")
+                time.sleep(1)  # Brief pause before retrying
             
     except Exception as e:
         logger.error(f"Failed to prepare tensor for upload to {file_path}: {e}")
@@ -323,6 +321,8 @@ def process_split(split_name: str, from_time: float, to_time: Optional[float],
             filename = f"{tensor_idx:04d}.pt"
             file_path = f"{subfolder_path}/{filename}"
             
+            # save_tensor will block until there's space in the upload queue
+            # It will only return False if there's a filesystem error
             if save_tensor(fs, tensor, file_path, frames_per_sample=frames_per_sample, crop_duration=crop_duration):
                 samples_collected += 1
                 samples_in_current_subfolder += 1
@@ -334,11 +334,13 @@ def process_split(split_name: str, from_time: float, to_time: Optional[float],
                 
                 # Log progress
                 if samples_collected % 100 == 0:
-                    logger.info(f"{split_name}: {samples_collected}/{target_samples} samples collected")
+                    queue_size = upload_queue.qsize()
+                    logger.info(f"{split_name}: {samples_collected}/{target_samples} samples collected (upload queue: {queue_size}/{MAX_QUEUE_SIZE})")
                     # Force garbage collection periodically
                     gc.collect()
             else:
-                logger.warning(f"Failed to save sample {samples_collected} for {split_name}")
+                logger.error(f"Failed to save sample {samples_collected} for {split_name} due to filesystem error")
+                # Continue processing other samples even if this one failed
             
             # Clear batch from memory
             del batch
@@ -478,7 +480,7 @@ def test_setup(
         test_samples=test_samples,
         valid_samples=test_samples,
         train_samples=test_samples,
-        crop_duration=10.2,
+        crop_duration=30.5,
         max_videos_queue=2,
         max_tensors_queue=10
     )

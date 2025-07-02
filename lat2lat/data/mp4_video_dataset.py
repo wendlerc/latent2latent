@@ -14,6 +14,8 @@ from torchvision import transforms
 from torchvision.io import read_video
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
+import gc
+import psutil
 
 load_dotenv("/home/developer/workspace/.env2")
 
@@ -22,16 +24,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class RandomizedQueue:
-    def __init__(self):
+    def __init__(self, max_size=None):
         self.items = []
         self.lock = threading.Lock()
         self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.max_size = max_size
 
-    def add(self, item):
+    def add(self, item, timeout=5.0):
         with self.lock:
+            if self.max_size is not None:
+                start_time = time.time()
+                while len(self.items) >= self.max_size:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        return False  # Timeout
+                    if not self.not_full.wait(timeout=remaining):
+                        return False  # Timeout
             idx = random.randint(0, len(self.items))
             self.items.insert(idx, item)
             self.not_empty.notify()
+            return True
 
     def pop(self, timeout=5.0):
         with self.lock:
@@ -45,11 +58,16 @@ class RandomizedQueue:
             if not self.items:  # Double check after wait
                 return None
             idx = random.randint(0, len(self.items) - 1)
-            return self.items.pop(idx)
+            item = self.items.pop(idx)
+            if self.max_size is not None:
+                self.not_full.notify()
+            return item
 
     def clear(self):
         with self.lock:
             self.items.clear()
+            if self.max_size is not None:
+                self.not_full.notify_all()
 
     def size(self):
         with self.lock:
@@ -74,6 +92,8 @@ class MP4VideoDataset(IterableDataset):
                  max_videos_queue=6,
                  max_tensors_queue=50,
                  max_videos=None,
+                 max_memory_gb=25,  # Memory limit in GB
+                 retry_attempts=3,  # Number of retry attempts for failed operations
                  rank=0, 
                  world_size=1):
         super().__init__()
@@ -89,21 +109,17 @@ class MP4VideoDataset(IterableDataset):
         self.max_videos_queue = max_videos_queue
         self.max_tensors_queue = max_tensors_queue
         self.max_videos = max_videos  # Maximum number of videos to process (None = unlimited)
+        self.max_memory_gb = max_memory_gb
+        self.retry_attempts = retry_attempts
         self.rank = rank
         self.world_size = world_size
         
         # Setup S3 filesystem
         self.fs = self._get_fs()
         
-        # Initialize video transform - keep as uint8 for memory efficiency
-        self.transform = transforms.Compose([
-            transforms.Resize((target_height, target_width)),
-            # No dtype conversion - keep as uint8
-        ])
-        
-        # Initialize queues
-        self.video_queue = RandomizedQueue()  # Queue of video file paths
-        self.tensor_queue = RandomizedQueue()  # Queue of processed tensors
+        # Initialize queues with memory-aware sizing
+        self.video_queue = RandomizedQueue(max_size=max_videos_queue)
+        self.tensor_queue = RandomizedQueue(max_size=max_tensors_queue)
         
         # Thread pool for concurrent video extraction
         self.video_extractor_pool = ThreadPoolExecutor(max_workers=max_videos_queue, thread_name_prefix="VideoExtractor")
@@ -122,9 +138,10 @@ class MP4VideoDataset(IterableDataset):
         # Shutdown flag for graceful cleanup
         self.shutdown_flag = threading.Event()
         
-        # Get available MP4 keys once at startup
-        self.available_keys = self._get_all_keys()
-        logger.info(f"Found {len(self.available_keys)} MP4 files in bucket")
+        # Get available MP4 keys once at startup with sharding for distributed training
+        all_keys = self._get_all_keys()
+        self.available_keys = self._shard_keys_for_rank(all_keys)
+        logger.info(f"Found {len(all_keys)} total MP4 files, rank {rank} will process {len(self.available_keys)} files")
         
         # Start background threads
         self.video_thread = threading.Thread(target=self._background_extract_videos, daemon=True)
@@ -133,6 +150,7 @@ class MP4VideoDataset(IterableDataset):
         self.tensor_thread.start()
         
         logger.info(f"MP4VideoDataset initialized for rank {rank}/{world_size} with {max_videos_queue} concurrent video extractors and {max_videos_queue} concurrent tensor processors")
+        logger.info(f"Memory limit: {max_memory_gb}GB, Retry attempts: {retry_attempts}")
         
         # Log max videos limit if specified
         if self.max_videos is not None:
@@ -143,6 +161,20 @@ class MP4VideoDataset(IterableDataset):
             from_str = f"{self.from_time:.1f}s" if self.from_time is not None else "start"
             to_str = f"{self.to_time:.1f}s" if self.to_time is not None else "end"
             logger.info(f"Time range constraints: sampling from {from_str} to {to_str}")
+
+    def _shard_keys_for_rank(self, all_keys):
+        """Shard keys across ranks for distributed training"""
+        if self.world_size == 1:
+            return all_keys
+        
+        # Sort keys for deterministic sharding
+        sorted_keys = sorted(all_keys)
+        
+        # Simple modulo-based sharding
+        sharded_keys = [key for i, key in enumerate(sorted_keys) if i % self.world_size == self.rank]
+        
+        logger.info(f"Rank {self.rank}/{self.world_size}: sharded {len(sharded_keys)} keys from {len(all_keys)} total")
+        return sharded_keys
 
     def _get_fs(self):
         kwargs = {
@@ -174,35 +206,70 @@ class MP4VideoDataset(IterableDataset):
         
         return keys
 
+    def _check_memory_usage(self):
+        """Check if memory usage is within limits"""
+        try:
+            process = psutil.Process()
+            memory_gb = process.memory_info().rss / (1024**3)
+            return memory_gb < self.max_memory_gb
+        except:
+            # If psutil fails, assume we're OK
+            return True
+
+    def _retry_operation(self, operation, operation_name, *args, **kwargs):
+        """Retry an operation with exponential backoff"""
+        for attempt in range(self.retry_attempts):
+            try:
+                return operation(*args, **kwargs)
+            except Exception as e:
+                if attempt == self.retry_attempts - 1:
+                    logger.error(f"{operation_name} failed after {self.retry_attempts} attempts: {e}")
+                    raise
+                else:
+                    wait_time = (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff with jitter
+                    logger.warning(f"{operation_name} failed (attempt {attempt + 1}/{self.retry_attempts}): {e}. Retrying in {wait_time:.1f}s")
+                    time.sleep(wait_time)
+
     def _extract_video_crop(self, key):
         logger.info(f"Extracting video crop for {key}")
         """Extract a video crop using ffmpeg directly with S3 presigned URL"""
+        out_path = None
         try:
-            # Generate presigned URL
-            presigned_url = self.fs.url(key, expires=3600)
+            # Note: Memory check is now done in background threads before starting extraction
+            # This prevents starting new extractions when memory is high
+
+            # Generate presigned URL with retry
+            def get_presigned_url():
+                return self.fs.url(key, expires=3600)
             
-            # Get video duration and color space info using ffprobe
-            probe_cmd = [
-                'ffprobe', '-v', 'quiet',
-                '-print_format', 'json',
-                '-show_format', '-show_streams',
-                presigned_url
-            ]
+            presigned_url = self._retry_operation(get_presigned_url, "S3 presigned URL generation")
             
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                logger.warning(f"ffprobe failed for {key}: {result.stderr}")
+            # Get video duration and color space info using ffprobe with retry
+            def run_ffprobe():
+                probe_cmd = [
+                    'ffprobe', '-v', 'quiet',
+                    '-print_format', 'json',
+                    '-show_format', '-show_streams',
+                    presigned_url
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffprobe failed: {result.stderr}")
+                return json.loads(result.stdout)
+            
+            info = self._retry_operation(run_ffprobe, "ffprobe execution")
+            if info is None:
+                logger.warning(f"ffprobe returned None for {key}")
                 return None
                 
-            info = json.loads(result.stdout)
             duration = float(info.get('format', {}).get('duration', 0))
             
             # Extract color space info and use it for FFmpeg
             video_stream = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), {})
-            color_space = video_stream.get('color_space', 'bt2020nc')  # Default to high quality bt2020nc
+            color_space = video_stream.get('color_space', 'bt709')  # More conservative default
             color_range = video_stream.get('color_range', 'pc')   
-            color_primaries = video_stream.get('color_primaries', 'bt2020')  # Default to high quality bt2020
-            color_trc = video_stream.get('color_trc', 'smpte2084')  # Default to high quality PQ
+            color_primaries = video_stream.get('color_primaries', 'bt709')  # More conservative default
+            color_trc = video_stream.get('color_trc', 'bt709')  # More conservative default
             
             logger.info(f"Using color info - space: {color_space}, range: {color_range}, primaries: {color_primaries}")
             
@@ -240,42 +307,47 @@ class MP4VideoDataset(IterableDataset):
                 'unknown': 'pc'  # Default to full range for safety
             }
             output_range = range_mapping.get(color_range, 'pc')  # Default to full range for high quality
-            output_range = 'pc'
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',  # overwrite output
-                '-ss', str(start),  # seek to start time
-                '-i', presigned_url,  # input from S3
-                '-t', str(self.crop_duration),  # duration
-                '-c:v', 'libx264',  # video codec
-                '-c:a', 'aac',  # audio codec
-                '-r', '30',  # Force 30 FPS for consistent frame counts
-                # Use detected color space settings to preserve original appearance
-                '-colorspace', color_space,
-                '-color_primaries', color_primaries,
-                '-color_trc', color_trc,
-                '-color_range', output_range,
-                '-vf', f'scale={self.target_width}:{self.target_height}:in_color_matrix={color_space}:in_range={output_range}:out_color_matrix={color_space}:out_range={output_range}',
-                '-crf', '18',  # High quality to minimize artifacts
-                '-preset', 'fast',  # Balance speed vs quality
-                '-err_detect', 'ignore_err',
-                '-fflags', '+igndts',
-                '-movflags', '+frag_keyframe+empty_moov',
-                '-avoid_negative_ts', 'make_zero',  # handle timing issues
-                out_path
-            ]
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                logger.warning(f"ffmpeg failed for {key}: {result.stderr}")
-                try:
-                    os.unlink(out_path)
-                except:
-                    pass
-                return None
+            
+            def run_ffmpeg():
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',  # overwrite output
+                    '-ss', str(start),  # seek to start time
+                    '-i', presigned_url,  # input from S3
+                    '-t', str(self.crop_duration),  # duration
+                    '-c:v', 'libx264',  # video codec
+                    '-c:a', 'aac',  # audio codec
+                    '-r', '30',  # Force 30 FPS for consistent frame counts
+                    # Use detected color space settings to preserve original appearance
+                    '-colorspace', color_space,
+                    '-color_primaries', color_primaries,
+                    '-color_trc', color_trc,
+                    '-color_range', output_range,
+                    '-vf', f'scale={self.target_width}:{self.target_height}:in_color_matrix={color_space}:in_range={output_range}:out_color_matrix={color_space}:out_range={output_range}',
+                    '-crf', '18',  # High quality to minimize artifacts
+                    '-preset', 'fast',  # Balance speed vs quality
+                    '-err_detect', 'ignore_err',
+                    '-fflags', '+igndts',
+                    '-movflags', '+frag_keyframe+empty_moov',
+                    '-avoid_negative_ts', 'make_zero',  # handle timing issues
+                    out_path
+                ]
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                if result.returncode != 0:
+                    raise RuntimeError(f"ffmpeg failed: {result.stderr}")
+                return result
+            
+            self._retry_operation(run_ffmpeg, "ffmpeg execution")
             
             return out_path
 
         except Exception as e:
             logger.error(f"Error extracting crop from {key}: {e}")
+            # Clean up temporary file if it was created
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except:
+                    pass
             return None
 
     def _on_extraction_complete(self, future):
@@ -283,8 +355,16 @@ class MP4VideoDataset(IterableDataset):
         try:
             video_path = future.result()
             if video_path:
-                self.video_queue.add(video_path)
-                logger.debug(f"Added video to queue: {video_path}")
+                # Try to add to queue with longer timeout, blocking if memory is high
+                success = self.video_queue.add(video_path, timeout=30.0)  # Longer timeout to wait for memory to free up
+                if success:
+                    logger.debug(f"Added video to queue: {video_path}")
+                else:
+                    logger.warning(f"Video queue full after timeout, discarding: {video_path}")
+                    try:
+                        os.unlink(video_path)
+                    except:
+                        pass
         except Exception as e:
             logger.error(f"Video extraction failed: {e}")
         finally:
@@ -305,10 +385,15 @@ class MP4VideoDataset(IterableDataset):
                 pass
             
             if tensors is not None:
+                # Try to add tensors with longer timeout, blocking if memory is high
                 for tensor in tensors:
                     if tensor is not None:
-                        self.tensor_queue.add(tensor)
-                        logger.debug(f"Added tensor to queue, shape: {tensor.shape}")
+                        success = self.tensor_queue.add(tensor, timeout=30.0)  # Longer timeout to wait for memory to free up
+                        if success:
+                            logger.debug(f"Added tensor to queue, shape: {tensor.shape}")
+                        else:
+                            logger.warning("Tensor queue full after timeout, discarding remaining tensors")
+                            break
                         
                         # Check if tensor queue is getting full
                         if self.tensor_queue.size() >= self.max_tensors_queue:
@@ -331,12 +416,22 @@ class MP4VideoDataset(IterableDataset):
                             logger.info(f"Reached maximum videos limit ({self.max_videos}), stopping video extraction")
                             break
                 
+                # Check memory usage and backpressure - block new downloads if memory is high
+                if not self._check_memory_usage():
+                    logger.debug("Memory usage high, blocking new video downloads until memory frees up")
+                    time.sleep(5)
+                    continue
+                
                 # Check if we need more videos and can start more extractions
                 with self.extraction_lock:
                     current_total = self.video_queue.size() + self.pending_extractions
                 
                 if current_total < self.max_videos_queue:
                     # Pick a random key
+                    if not self.available_keys:
+                        logger.warning("No more keys available for this rank")
+                        break
+                    
                     key = random.choice(self.available_keys)
                     
                     # Increment attempted videos counter when submitting task
@@ -371,6 +466,12 @@ class MP4VideoDataset(IterableDataset):
         """Background thread to manage concurrent tensor processing"""
         while not self.shutdown_flag.is_set():
             try:
+                # Check memory usage and backpressure - block new processing if memory is high
+                if not self._check_memory_usage():
+                    logger.debug("Memory usage high, blocking new tensor processing until memory frees up")
+                    time.sleep(5)
+                    continue
+                
                 # Check if we need more tensor processing and can start more tasks
                 with self.tensor_processing_lock:
                     current_processing = self.pending_tensor_processing
@@ -413,6 +514,9 @@ class MP4VideoDataset(IterableDataset):
         Returns tensors in uint8 format (0-255 range) for memory efficiency.
         """
         try:
+            # Note: Memory check is now done in background threads before starting processing
+            # This prevents starting new processing when memory is high
+            
             # Read video using torchvision
             video_tensor, audio_tensor, info = read_video(video_path, pts_unit='sec')
             
@@ -570,7 +674,9 @@ if __name__ == "__main__":
         crop_duration=10.2,
         max_videos_queue=6,  # Fewer videos needed
         max_tensors_queue=18, # More tensors per video
-        max_videos=3  # Test with limited number of videos
+        max_videos=3,  # Test with limited number of videos
+        max_memory_gb=8,  # 8GB memory limit
+        retry_attempts=3  # 3 retry attempts
     )
     
     logger.info("⏱️  Loading 5 batches for timing analysis...")
