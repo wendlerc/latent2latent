@@ -18,6 +18,7 @@ import io
 from queue import Queue, Full
 from threading import Thread, Event, Lock
 import gc
+import math
 
 # Local imports
 import sys
@@ -32,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Global upload queue and worker thread
-MAX_QUEUE_SIZE = 50  # Limit number of tensors in memory
+MAX_QUEUE_SIZE = 100  # Increased queue size to allow more buffering
 upload_queue = Queue(maxsize=MAX_QUEUE_SIZE)
 upload_pool = None
 stop_event = Event()
@@ -43,12 +44,32 @@ upload_stats = {
     'last_log_time': time.time()
 }
 
+def calculate_upload_workers(download_workers, frames_per_sample, crop_duration):
+    """Calculate optimal number of upload workers based on tensor output ratio."""
+    # Each download worker processes videos of crop_duration length
+    # Each video is split into tensors of frames_per_sample frames
+    # Assuming 30fps video
+    frames_per_video = crop_duration * 30
+    tensors_per_video = math.ceil(frames_per_video / frames_per_sample)
+    
+    # Each download worker will produce tensors_per_video tensors
+    # We want enough upload workers to handle this load
+    # Using a ratio of 2 upload workers per tensor per download worker
+    upload_workers = download_workers * tensors_per_video * 2
+    
+    # Cap at a reasonable maximum
+    return min(upload_workers, 32)
+
 def upload_worker():
     """Background worker that processes tensor uploads from the queue."""
     while not stop_event.is_set() or not upload_queue.empty():
         try:
             # Get item from queue with timeout to allow checking stop_event
-            item = upload_queue.get(timeout=1)
+            try:
+                item = upload_queue.get(timeout=1)
+            except:
+                continue
+                
             if item is None:
                 continue
                 
@@ -74,13 +95,18 @@ def upload_worker():
                 upload_queue.task_done()
                 gc.collect()  # Help clean up memory
                 
-        except Exception:
+        except Exception as e:
+            logger.error(f"Upload worker error: {e}")
             continue
 
-def ensure_upload_pool(num_workers=6):
+def ensure_upload_pool(num_workers=None, frames_per_sample=101, crop_duration=30.5):
     """Ensure the upload worker pool is running."""
     global upload_pool
     if upload_pool is None:
+        if num_workers is None:
+            # Default to 6 download workers if not specified
+            num_workers = calculate_upload_workers(6, frames_per_sample, crop_duration)
+        
         stop_event.clear()
         upload_pool = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="TensorUploader")
         # Start the workers
@@ -145,7 +171,7 @@ def cleanup_upload_pool():
                 pass
         gc.collect()
 
-def save_tensor(fs, tensor: torch.Tensor, file_path: str):
+def save_tensor(fs, tensor: torch.Tensor, file_path: str, frames_per_sample=101, crop_duration=30.5):
     """Save tensor to file using fsspec asynchronously."""
     try:
         # Convert tensor to bytes
@@ -154,15 +180,15 @@ def save_tensor(fs, tensor: torch.Tensor, file_path: str):
         buffer.seek(0)
         
         # Ensure upload pool is running
-        ensure_upload_pool()
+        ensure_upload_pool(frames_per_sample=frames_per_sample, crop_duration=crop_duration)
         
         # Try to add to upload queue with timeout
         max_retries = 3
         retry_count = 0
         while retry_count < max_retries:
             try:
-                # If queue is full, wait up to 60 seconds
-                upload_queue.put((fs, buffer, file_path), timeout=60)
+                # If queue is full, wait up to 30 seconds
+                upload_queue.put((fs, buffer, file_path), timeout=30)
                 
                 # Free memory immediately after queuing
                 del tensor
@@ -172,8 +198,8 @@ def save_tensor(fs, tensor: torch.Tensor, file_path: str):
             except Full:
                 retry_count += 1
                 if retry_count < max_retries:
-                    logger.warning(f"Upload queue full, retrying in 30 seconds... (attempt {retry_count}/{max_retries})")
-                    time.sleep(30)  # Wait 30 seconds before retrying
+                    logger.warning(f"Upload queue full, retrying in 10 seconds... (attempt {retry_count}/{max_retries})")
+                    time.sleep(10)  # Reduced wait time to keep things moving
                 else:
                     logger.error(f"Upload queue full after {max_retries} retries, could not save tensor to {file_path}")
                     buffer.close()
@@ -250,9 +276,9 @@ def process_split(split_name: str, from_time: float, to_time: Optional[float],
     logger.info(f"Processing {split_name} split: {from_time}s to {to_time}s")
     logger.info(f"Found {existing_samples} existing samples, will collect {target_samples - existing_samples} more")
     
-    crop_duration = loader_kwargs['crop_duration']
+    crop_duration = loader_kwargs.get('crop_duration', 30.5)
+    frames_per_sample = loader_kwargs.get('frames_per_sample', 101)
     nframes = crop_duration * 30
-    frames_per_sample = loader_kwargs['frames_per_sample']
     max_videos = (target_samples - existing_samples)//(nframes//frames_per_sample) + 10
     max_videos = None
     
@@ -297,7 +323,7 @@ def process_split(split_name: str, from_time: float, to_time: Optional[float],
             filename = f"{tensor_idx:04d}.pt"
             file_path = f"{subfolder_path}/{filename}"
             
-            if save_tensor(fs, tensor, file_path):
+            if save_tensor(fs, tensor, file_path, frames_per_sample=frames_per_sample, crop_duration=crop_duration):
                 samples_collected += 1
                 samples_in_current_subfolder += 1
                 
@@ -318,21 +344,6 @@ def process_split(split_name: str, from_time: float, to_time: Optional[float],
             del batch
             del tensor
             
-            # If queue is getting full, give it time to process
-            if upload_queue.qsize() > MAX_QUEUE_SIZE * 0.8:  # 80% full
-                logger.info("Upload queue filling up, waiting for space...")
-                wait_start = time.time()
-                while upload_queue.qsize() > MAX_QUEUE_SIZE * 0.5:  # Wait until 50% full
-                    time.sleep(1)
-                    # Add timeout to prevent infinite wait
-                    if time.time() - wait_start > 300:  # 5 minute timeout
-                        logger.warning("Queue wait timeout reached, continuing...")
-                        break
-            
-            # Log queue status periodically
-            if batch_idx % 10 == 0:
-                logger.info(f"Queue status - Size: {upload_queue.qsize()}/{MAX_QUEUE_SIZE}")
-    
     except KeyboardInterrupt:
         logger.info(f"{split_name}: Interrupted by user at {samples_collected} samples")
     except Exception as e:
@@ -425,11 +436,6 @@ def organize_dataset(
             fs=fs,
             **loader_kwargs
         )
-        
-        # Wait for remaining uploads to complete
-        if not upload_queue.empty():
-            logger.info("Waiting for remaining uploads to complete...")
-            upload_queue.join()
         
         # Clean up upload pool
         cleanup_upload_pool()
