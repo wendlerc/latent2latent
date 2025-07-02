@@ -74,22 +74,63 @@ def create_folder_structure(fs, base_path: str):
             logger.warning(f"Could not create folder {full_path}: {e}")
 
 
+def count_existing_samples(fs, split_name: str, base_path: str) -> int:
+    """Count existing samples in a split folder."""
+    total_samples = 0
+    
+    if split_name == "train":
+        # For train: check all 20 subfolders
+        for i in range(20):
+            folder_path = f"{base_path.rstrip('/')}/{split_name}/{i:04d}"
+            try:
+                files = fs.ls(folder_path)
+                pt_files = [f for f in files if f.endswith('.pt')]
+                total_samples += len(pt_files)
+            except Exception as e:
+                logger.debug(f"Error checking folder {folder_path}: {e}")
+    else:
+        # For test/valid: check subfolder 0000
+        folder_path = f"{base_path.rstrip('/')}/{split_name}/0000"
+        try:
+            files = fs.ls(folder_path)
+            pt_files = [f for f in files if f.endswith('.pt')]
+            total_samples = len(pt_files)
+        except Exception as e:
+            logger.debug(f"Error checking folder {folder_path}: {e}")
+    
+    return total_samples
+
+
 def process_split(split_name: str, from_time: float, to_time: Optional[float], 
                  target_samples: int, base_path: str, fs, **loader_kwargs):
     """Process a data split (train/valid/test)."""
-    logger.info(f"Processing {split_name} split: {from_time}s to {to_time}s, target: {target_samples} samples")
+    # Check existing samples
+    existing_samples = count_existing_samples(fs, split_name, base_path)
+    if existing_samples >= target_samples:
+        logger.info(f"{split_name} split already has {existing_samples} samples (target: {target_samples})")
+        return existing_samples
     
+    logger.info(f"Processing {split_name} split: {from_time}s to {to_time}s")
+    logger.info(f"Found {existing_samples} existing samples, will collect {target_samples - existing_samples} more")
+    crop_duration = loader_kwargs['crop_duration']
+    nframes = crop_duration * 30
+    frames_per_sample = loader_kwargs['frames_per_sample']
+    max_videos = (target_samples - existing_samples)//(nframes//frames_per_sample) + 10
     # Create dataloader for this time range
     loader = get_video_loader(
         batch_size=1,
         from_time=from_time,
         to_time=to_time,
+        max_videos=max_videos,
         **loader_kwargs
     )
     
-    samples_collected = 0
-    current_subfolder = 0
-    samples_in_current_subfolder = 0
+    samples_collected = existing_samples
+    if split_name == "train":
+        current_subfolder = existing_samples // 1000
+        samples_in_current_subfolder = existing_samples % 1000
+    else:
+        samples_in_current_subfolder = existing_samples
     
     try:
         for batch_idx, batch in enumerate(loader):
@@ -147,12 +188,12 @@ def organize_dataset(
     frames_per_sample: int = typer.Option(101, help="Number of frames per sample"),
     target_height: int = typer.Option(360, help="Target video height"),
     target_width: int = typer.Option(640, help="Target video width"),
-    crop_duration: float = typer.Option(10.2, help="Duration of video crops in seconds"),
+    crop_duration: float = typer.Option(61, help="Duration of video crops in seconds"),
     max_videos_queue: int = typer.Option(6, help="Max videos in processing queue"),
     max_tensors_queue: int = typer.Option(50, help="Max tensors in processing queue"),
-    test_samples: int = typer.Option(5, help="Number of test samples"),
-    valid_samples: int = typer.Option(5, help="Number of validation samples"),
-    train_samples: int = typer.Option(10, help="Number of training samples"),
+    test_samples: int = typer.Option(1000, help="Number of test samples"),
+    valid_samples: int = typer.Option(1000, help="Number of validation samples"),
+    train_samples: int = typer.Option(20000, help="Number of training samples"),
 ):
     """Organize video dataset into train/valid/test splits based on time ranges."""
     
