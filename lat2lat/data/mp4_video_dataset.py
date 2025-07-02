@@ -60,6 +60,7 @@ class MP4VideoDataset(IterableDataset):
                  to_time=None,
                  max_videos_queue=5,
                  max_tensors_queue=50,
+                 max_videos=None,
                  rank=0, 
                  world_size=1):
         super().__init__()
@@ -74,6 +75,7 @@ class MP4VideoDataset(IterableDataset):
         self.to_time = to_time      # End time in seconds (None = go to end)
         self.max_videos_queue = max_videos_queue
         self.max_tensors_queue = max_tensors_queue
+        self.max_videos = max_videos  # Maximum number of videos to process (None = unlimited)
         self.rank = rank
         self.world_size = world_size
         
@@ -100,6 +102,10 @@ class MP4VideoDataset(IterableDataset):
         self.pending_tensor_processing = 0  # Track pending tensor processing tasks
         self.tensor_processing_lock = threading.Lock()  # Lock for pending_tensor_processing counter
         
+        # Track attempted videos count
+        self.attempted_videos_count = 0
+        self.attempted_videos_lock = threading.Lock()
+        
         # Shutdown flag for graceful cleanup
         self.shutdown_flag = threading.Event()
         
@@ -114,6 +120,10 @@ class MP4VideoDataset(IterableDataset):
         self.tensor_thread.start()
         
         logger.info(f"MP4VideoDataset initialized for rank {rank}/{world_size} with {max_videos_queue} concurrent video extractors and {max_videos_queue} concurrent tensor processors")
+        
+        # Log max videos limit if specified
+        if self.max_videos is not None:
+            logger.info(f"Maximum videos limit: {self.max_videos}")
         
         # Log time range constraints if specified
         if self.from_time is not None or self.to_time is not None:
@@ -301,6 +311,13 @@ class MP4VideoDataset(IterableDataset):
         """Background thread to manage concurrent video extractions"""
         while not self.shutdown_flag.is_set():
             try:
+                # Check if we've reached the max videos limit
+                if self.max_videos is not None:
+                    with self.attempted_videos_lock:
+                        if self.attempted_videos_count >= self.max_videos:
+                            logger.info(f"Reached maximum videos limit ({self.max_videos}), stopping video extraction")
+                            break
+                
                 # Check if we need more videos and can start more extractions
                 with self.extraction_lock:
                     current_total = self.video_queue.size() + self.pending_extractions
@@ -308,6 +325,12 @@ class MP4VideoDataset(IterableDataset):
                 if current_total < self.max_videos_queue:
                     # Pick a random key
                     key = random.choice(self.available_keys)
+                    
+                    # Increment attempted videos counter when submitting task
+                    if self.max_videos is not None:
+                        with self.attempted_videos_lock:
+                            self.attempted_videos_count += 1
+                            logger.debug(f"Attempting video download {self.attempted_videos_count}/{self.max_videos}")
                     
                     # Submit extraction task to thread pool
                     with self.extraction_lock:
@@ -451,13 +474,14 @@ def collate_fn(batch):
     """Collate function to stack video tensors"""
     return torch.stack(batch)
 
-def get_video_loader(batch_size=4, from_time=None, to_time=None, **dataset_kwargs):
+def get_video_loader(batch_size=4, from_time=None, to_time=None, max_videos=None, **dataset_kwargs):
     """Create a DataLoader for MP4 videos
     
     Args:
         batch_size: Batch size for the DataLoader
         from_time: Start time in seconds for video sampling (None = start from beginning)
         to_time: End time in seconds for video sampling (None = go to end)
+        max_videos: Maximum number of videos to process (None = unlimited)
         **dataset_kwargs: Additional arguments passed to MP4VideoDataset
     """
     if dist.is_initialized():
@@ -472,6 +496,7 @@ def get_video_loader(batch_size=4, from_time=None, to_time=None, **dataset_kwarg
         world_size=world_size, 
         from_time=from_time,
         to_time=to_time,
+        max_videos=max_videos,
         **dataset_kwargs
     )
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
@@ -498,7 +523,8 @@ if __name__ == "__main__":
         target_width=640,
         crop_duration=10.2,
         max_videos_queue=6,  # Fewer videos needed
-        max_tensors_queue=(61*30)//101 # More tensors per video
+        max_tensors_queue=(61*30)//101, # More tensors per video
+        max_videos=3  # Test with limited number of videos
     )
     
     logger.info("⏱️  Loading 5 batches for timing analysis...")
@@ -531,3 +557,4 @@ if __name__ == "__main__":
     logger.info(f"✅ Tensor stats (uint8) - min: {batch.min()}, max: {batch.max()}, mean: {batch.float().mean():.1f}")
     logger.info(f"✅ Memory usage: ~4x less than float32!")
     logger.info(f"✅ Expected: ~2-3 samples per 10s video = 3x more efficient!")
+    logger.info(f"✅ Test completed with max_videos=3 limit!")
