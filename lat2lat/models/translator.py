@@ -51,13 +51,15 @@ class LatentTranslator(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Input tensor of shape (batch, 128, 4, 4)
+            x: Input tensor of shape (batch, n, 128, 4, 4)
         Returns:
-            Output tensor of shape (1 + (batch-1)//4, 16, 64, 64)
+            Output tensor of shape (batch, 1 + (n-1)//4, 16, 64, 64)
         """
         # Initial channel reduction
-        assert (x.shape[0] -1)%4 == 0, "Batch size -1 must be divisible by 4"
-        x = self.conv_in(x)
+        assert (x.shape[1] -1)%4 == 0, "Batch size -1 must be divisible by 4"
+        b, n, c, h, w = x.shape
+        x_flat = x.reshape(b*n, c, h, w)
+        x = self.conv_in(x_flat)
         # Progressive upsampling stages (3 stages instead of 4)
         x = self.stage1(x)  # 4x4 -> 8x8, 64 -> 32 channels
         x = self.stage2(x)  # 8x8 -> 16x16, 32 -> 16 channels
@@ -65,7 +67,7 @@ class LatentTranslator(nn.Module):
         x = self.stage4(x)  # 32x32 -> 64x64, 8 -> 4 channels
         # Final refinement
         x = self.final(x)
-        return x
+        return x.reshape(b, n, -1, self.output_size, self.output_size)
     
     def translate_batch(self, x):
         """
@@ -73,16 +75,16 @@ class LatentTranslator(nn.Module):
         Treats the first dimension separately as suggested.
         
         Args:
-            x: Input tensor of shape (101, 128, 4, 4)
+            x: Input tensor of shape (b, 101, 128, 4, 4)
         Returns:
-            Output tensor of shape (26, 16, 64, 64)
+            Output tensor of shape (b, 26, 16, 64, 64)
         """
-        assert (x.shape[0] -1)%4 == 0, "Batch size -1 must be divisible by 4"
+        assert (x.shape[1] -1)%4 == 0, "Batch size -1 must be divisible by 4"
         translated = self.forward(x)
-        n, c, h, w = translated.shape
-        helper = translated[1:].reshape((n-1)//4, 4, c, h, w)
-        reshaped = helper.mean(dim=1)
-        return torch.cat([translated[0:1], reshaped], dim=0)
+        b, n, c, h, w = translated.shape
+        helper = translated[:, 1:].reshape(b, (n-1)//4, 4, c, h, w)
+        reshaped = helper.mean(dim=2)
+        return torch.cat([translated[:, 0:1], reshaped], dim=1)
 
     
 def translator_test():
@@ -92,13 +94,13 @@ def translator_test():
     # Test single sample translation
     with torch.no_grad():
         # Test batch translation: 101x128x4x4 -> 26x16x64x64
-        batch_input = torch.randn(101, 128, 4, 4)
+        batch_input = torch.randn(2, 101, 128, 4, 4)
         batch_output = translator.translate_batch(batch_input)
-        assert batch_output.shape == (26, 16, 64, 64), f"Batch translation test failed: expected (26, 16, 64, 64), got {batch_output.shape}"
+        assert batch_output.shape == (2, 26, 16, 64, 64), f"Batch translation test failed: expected (2, 26, 16, 64, 64), got {batch_output.shape}"
 
-        batch_input = torch.randn(17, 128, 4, 4)
+        batch_input = torch.randn(2, 17, 128, 4, 4)
         batch_output = translator.translate_batch(batch_input)
-        assert batch_output.shape == (5, 16, 64, 64), f"Batch translation test failed: expected (17, 16, 64, 64), got {batch_output.shape}"
+        assert batch_output.shape == (2, 5, 16, 64, 64), f"Batch translation test failed: expected (17, 16, 64, 64), got {batch_output.shape}"
 
     print("LatentTranslator tests passed!")
     
