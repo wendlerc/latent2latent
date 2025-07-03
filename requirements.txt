@@ -9,3 +9,6 @@ python-dotenv
 s3fs
 av
 torchcodec
+pytorch_lightning
+ema-pytorch
+muon_optimizer
