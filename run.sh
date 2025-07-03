@@ -8,8 +8,7 @@ python generate_paired_dataset.py \
     --data-url s3://cod-yt-latent-pairs/vids_pt/train \
     --output-path /home/developer/workspace/data/paired_test \
     --num-gpus 1 \
-    --batch-size 8 \
-    --sequence-length 5 \
+    --sequence-length 17 \
     --shard-size-mb 10 \
     --dtype bfloat16 \
     --num-workers 1 \
