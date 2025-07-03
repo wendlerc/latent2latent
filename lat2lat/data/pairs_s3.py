@@ -194,7 +194,7 @@ class LatentPairs(IterableDataset):
                                     if len(self.data_queue.items) >= self.max_data:
                                         break
                                     
-                                    self.data_queue.add((wan_tensor, dcae_tensor))
+                                    self.data_queue.add((dcae_tensor, wan_tensor))
 
                 except Exception as e:
                     logger.error(f"Error processing tar: {e}")
