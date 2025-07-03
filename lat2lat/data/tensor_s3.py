@@ -24,7 +24,8 @@ class S3CoDLatentDataset(IterableDataset):
                  rank=0, 
                  world_size=1, 
                  deterministic=True,
-                 prefetch_size=100):
+                 prefetch_size=100,
+                 loop_forever=False):
         super().__init__()
         
         self.window = window_length
@@ -33,6 +34,7 @@ class S3CoDLatentDataset(IterableDataset):
         self.url = url
         self.deterministic = deterministic
         self.prefetch_size = prefetch_size
+        self.loop_forever = loop_forever
 
         # Setup fsspec filesystem
         self.fs = self._get_fs()
@@ -146,6 +148,7 @@ class S3CoDLatentDataset(IterableDataset):
     def _prefetch_worker(self):
         """Background thread to prefetch and process data"""
         file_index = 0
+        done_once = False
         
         while True:
             # Check if we need more data
@@ -178,6 +181,9 @@ class S3CoDLatentDataset(IterableDataset):
                 self.files_processed += 1
                 file_index += 1
             else:
+                if not self.loop_forever:
+                    logger.info(f"Completed processing all {len(self.file_paths)} files, not looping (loop_forever=False)")
+                    break
                 # If we've processed all files, restart from beginning
                 logger.info(f"Completed processing all {len(self.file_paths)} files, restarting from beginning")
                 if not self.deterministic:
@@ -191,7 +197,7 @@ class S3CoDLatentDataset(IterableDataset):
         """Iterate over prefetched data samples"""
         logger.info(f"Starting iteration, initial queue size: {len(self.data_queue)}")
         empty_queue_count = 0
-        
+        yielded_any = False
         while True:
             if self.data_queue:
                 sample = self.data_queue.popleft()
@@ -202,8 +208,13 @@ class S3CoDLatentDataset(IterableDataset):
                     logger.info(f"Yielded {self.samples_yielded} samples, queue size: {queue_size}/{self.prefetch_size}, files processed: {self.files_processed}")
                 
                 yield sample
+                yielded_any = True
                 empty_queue_count = 0  # Reset counter
             else:
+                # If not looping forever and prefetch thread is done, break
+                if not self.loop_forever and self.files_processed >= len(self.file_paths):
+                    logger.info("No more data to yield and loop_forever is False. Ending iteration.")
+                    break
                 empty_queue_count += 1
                 if empty_queue_count % 100 == 0:  # Log every 100 empty checks
                     logger.warning(f"Queue empty for {empty_queue_count} consecutive checks, waiting...")
