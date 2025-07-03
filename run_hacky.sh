@@ -1,0 +1,16 @@
+for start in $(seq 5500 250 19750); do
+    end=$((start + 250))
+    echo "Processing train samples $start to $end..."
+    echo "////////////////////////////////////////////////////////"
+    echo "////////////////////////////////////////////////////////"
+    echo "////////////////////////////////////////////////////////"
+    python organize_video_dataset_hacky.py process-train-range --output-path s3://cod-yt-latent-pairs/vids_pt/ --train-samples 20000 --train-from $start --train-to $end
+    echo "Done processing train samples $start to $end."
+    echo "////////////////////////////////////////////////////////"
+    echo "////////////////////////////////////////////////////////"
+    echo "////////////////////////////////////////////////////////"
+    pkill -f "ffmpeg"
+    sleep 30
+    rm -rf /tmp/*
+    sleep 10
+done

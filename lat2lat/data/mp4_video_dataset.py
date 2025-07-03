@@ -206,7 +206,7 @@ class MP4VideoDataset(IterableDataset):
                  from_time=None,
                  to_time=None,
                  max_parallel_downloads=8,
-                 max_memory_gb=25,
+                 max_memory_gb=15,
                  max_videos=None,
                  rank=0, 
                  world_size=1):

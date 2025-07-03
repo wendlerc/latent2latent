@@ -201,15 +201,19 @@ def get_filesystem(output_path: str):
         return fsspec.filesystem("file")
 
 
-def create_folder_structure(fs, base_path: str):
-    """Create the required folder structure."""
+def create_folder_structure(fs, base_path: str, train_from: int, train_to: int):
+    """Create the required folder structure based on train sample range."""
     folders = [
         "test/0000",
         "valid/0000"
     ]
     
-    # Add train subfolders
-    for i in range(20):
+    # Add train subfolders based on the sample range
+    # Each subfolder contains 1000 samples, so compute subfolder indices
+    start_subfolder = train_from // 1000
+    end_subfolder = (train_to - 1) // 1000 + 1  # -1 to handle edge case, +1 for exclusive
+    
+    for i in range(start_subfolder, end_subfolder):
         folders.append(f"train/{i:04d}")
     
     for folder in folders:
@@ -221,20 +225,19 @@ def create_folder_structure(fs, base_path: str):
             logger.warning(f"Could not create folder {full_path}: {e}")
 
 
-def count_existing_samples(fs, split_name: str, base_path: str) -> int:
-    """Count existing samples in a split folder."""
+def count_existing_samples(fs, split_name: str, base_path: str, train_from: int, train_to: int) -> int:
+    """Count existing samples in a split folder, only within the sample range [train_from, train_to)."""
     total_samples = 0
-    
     if split_name == "train":
-        # For train: check all 20 subfolders
-        for i in range(20):
-            folder_path = f"{base_path.rstrip('/')}/{split_name}/{i:04d}"
+        for sample_idx in range(train_from, train_to):
+            subfolder_idx = sample_idx // 1000
+            tensor_idx = sample_idx % 1000
+            file_path = f"{base_path.rstrip('/')}/train/{subfolder_idx:04d}/{tensor_idx:04d}.pt"
             try:
-                files = fs.ls(folder_path)
-                pt_files = [f for f in files if f.endswith('.pt')]
-                total_samples += len(pt_files)
+                if fs.exists(file_path):
+                    total_samples += 1
             except Exception as e:
-                logger.debug(f"Error checking folder {folder_path}: {e}")
+                logger.debug(f"Error checking file {file_path}: {e}")
     else:
         # For test/valid: check subfolder 0000
         folder_path = f"{base_path.rstrip('/')}/{split_name}/0000"
@@ -244,102 +247,133 @@ def count_existing_samples(fs, split_name: str, base_path: str) -> int:
             total_samples = len(pt_files)
         except Exception as e:
             logger.debug(f"Error checking folder {folder_path}: {e}")
-    
     return total_samples
 
 
 def process_split(split_name: str, from_time: float, to_time: Optional[float], 
-                 target_samples: int, base_path: str, fs, **loader_kwargs):
+                 target_samples: int, base_path: str, fs, train_from: int, train_to: int, **loader_kwargs):
     """Process a data split (train/valid/test)."""
-    # Check existing samples
-    existing_samples = count_existing_samples(fs, split_name, base_path)
-    if existing_samples >= target_samples:
-        logger.info(f"{split_name} split already has {existing_samples} samples (target: {target_samples})")
-        return existing_samples
-    
-    logger.info(f"Processing {split_name} split: {from_time}s to {to_time}s")
-    logger.info(f"Found {existing_samples} existing samples, will collect {target_samples - existing_samples} more")
-    
-    crop_duration = loader_kwargs.get('crop_duration', 30.5)
-    frames_per_sample = loader_kwargs.get('frames_per_sample', 101)
-    nframes = crop_duration * 30
-    max_videos = (target_samples - existing_samples)//(nframes//frames_per_sample) + 10
-    max_videos = None
-    
-    # Create dataloader for this time range
-    loader = get_video_loader(
-        batch_size=1,
-        from_time=from_time,
-        to_time=to_time,
-        max_videos=max_videos,
-        **loader_kwargs
-    )
-    
-    samples_collected = existing_samples
     if split_name == "train":
-        current_subfolder = existing_samples // 1000
-        samples_in_current_subfolder = existing_samples % 1000
+        # Count only the files in the relevant range
+        existing_samples = count_existing_samples(fs, split_name, base_path, train_from, train_to)
+        total_needed = train_to - train_from
+        if existing_samples >= total_needed:
+            logger.info(f"{split_name} split already has {existing_samples} samples in range [{train_from}, {train_to}) (target: {total_needed})")
+            return existing_samples
+        logger.info(f"Processing {split_name} split: samples {train_from} to {train_to} (exclusive)")
+        logger.info(f"Found {existing_samples} existing samples in range, will collect {total_needed - existing_samples} more")
+        
+        crop_duration = loader_kwargs.get('crop_duration', 30.5)
+        frames_per_sample = loader_kwargs.get('frames_per_sample', 101)
+        nframes = crop_duration * 30
+        max_videos = (total_needed - existing_samples)//(nframes//frames_per_sample) + 10
+        max_videos = None
+        
+        # Create dataloader for this time range
+        loader = get_video_loader(
+            batch_size=1,
+            from_time=from_time,
+            to_time=to_time,
+            max_videos=max_videos,
+            **loader_kwargs
+        )
+        
+        samples_collected = existing_samples
+        sample_indices = [i for i in range(train_from, train_to)]
+        # Only process missing files
+        missing_indices = []
+        for sample_idx in sample_indices:
+            subfolder_idx = sample_idx // 1000
+            tensor_idx = sample_idx % 1000
+            file_path = f"{base_path.rstrip('/')}/train/{subfolder_idx:04d}/{tensor_idx:04d}.pt"
+            if not fs.exists(file_path):
+                missing_indices.append((sample_idx, subfolder_idx, tensor_idx, file_path))
+        
+        if not missing_indices:
+            logger.info(f"No missing samples to process in range [{train_from}, {train_to})")
+            return samples_collected
+        
+        try:
+            loader_iter = iter(loader)
+            for idx, (sample_idx, subfolder_idx, tensor_idx, file_path) in enumerate(missing_indices):
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    logger.warning(f"Dataloader exhausted before all missing samples were generated.")
+                    break
+                # Remove batch dimension and move to CPU if needed
+                tensor = batch.squeeze(0)
+                if tensor.device.type != 'cpu':
+                    tensor = tensor.cpu()
+                # Save tensor
+                if save_tensor(fs, tensor, file_path, frames_per_sample=frames_per_sample, crop_duration=crop_duration):
+                    samples_collected += 1
+                    if samples_collected % 100 == 0:
+                        queue_size = upload_queue.qsize()
+                        logger.info(f"{split_name}: {samples_collected}/{total_needed} samples collected (upload queue: {queue_size}/{MAX_QUEUE_SIZE})")
+                        gc.collect()
+                else:
+                    logger.error(f"Failed to save sample {sample_idx} for {split_name} due to filesystem error")
+                del batch
+                del tensor
+        except KeyboardInterrupt:
+            logger.info(f"{split_name}: Interrupted by user at {samples_collected} samples")
+        except Exception as e:
+            logger.error(f"{split_name}: Error during processing: {e}")
+            raise
+        logger.info(f"{split_name}: Completed with {samples_collected} samples in range [{train_from}, {train_to})")
+        return samples_collected
     else:
+        # Original logic for test/valid
+        existing_samples = count_existing_samples(fs, split_name, base_path, train_from, train_to)
+        if existing_samples >= target_samples:
+            logger.info(f"{split_name} split already has {existing_samples} samples (target: {target_samples})")
+            return existing_samples
+        logger.info(f"Processing {split_name} split: {from_time}s to {to_time}s")
+        logger.info(f"Found {existing_samples} existing samples, will collect {target_samples - existing_samples} more")
+        crop_duration = loader_kwargs.get('crop_duration', 30.5)
+        frames_per_sample = loader_kwargs.get('frames_per_sample', 101)
+        nframes = crop_duration * 30
+        max_videos = (target_samples - existing_samples)//(nframes//frames_per_sample) + 10
+        max_videos = None
+        loader = get_video_loader(
+            batch_size=1,
+            from_time=from_time,
+            to_time=to_time,
+            max_videos=max_videos,
+            **loader_kwargs
+        )
+        samples_collected = existing_samples
         samples_in_current_subfolder = existing_samples
-    
-    try:
-        for batch_idx, batch in enumerate(loader):
-            if samples_collected >= target_samples:
-                break
-            
-            # Remove batch dimension and move to CPU if needed
-            tensor = batch.squeeze(0)
-            if tensor.device.type != 'cpu':
-                tensor = tensor.cpu()
-            
-            # Determine subfolder and filename
-            if split_name == "train":
-                # For train: distribute across 20 subfolders (0000-0019)
-                subfolder_idx = current_subfolder
-                tensor_idx = samples_in_current_subfolder
-                subfolder_path = f"{base_path.rstrip('/')}/{split_name}/{subfolder_idx:04d}"
-            else:
-                # For test/valid: use subfolder 0000
+        try:
+            for batch_idx, batch in enumerate(loader):
+                if samples_collected >= target_samples:
+                    break
+                tensor = batch.squeeze(0)
+                if tensor.device.type != 'cpu':
+                    tensor = tensor.cpu()
                 subfolder_path = f"{base_path.rstrip('/')}/{split_name}/0000"
                 tensor_idx = samples_collected
-            
-            # Save tensor
-            filename = f"{tensor_idx:04d}.pt"
-            file_path = f"{subfolder_path}/{filename}"
-            
-            # save_tensor will block until there's space in the upload queue
-            # It will only return False if there's a filesystem error
-            if save_tensor(fs, tensor, file_path, frames_per_sample=frames_per_sample, crop_duration=crop_duration):
-                samples_collected += 1
-                samples_in_current_subfolder += 1
-                
-                # For train split: move to next subfolder after 1000 samples
-                if split_name == "train" and samples_in_current_subfolder >= 1000:
-                    current_subfolder += 1
-                    samples_in_current_subfolder = 0
-                
-                # Log progress
-                if samples_collected % 100 == 0:
-                    queue_size = upload_queue.qsize()
-                    logger.info(f"{split_name}: {samples_collected}/{target_samples} samples collected (upload queue: {queue_size}/{MAX_QUEUE_SIZE})")
-                    # Force garbage collection periodically
-                    gc.collect()
-            else:
-                logger.error(f"Failed to save sample {samples_collected} for {split_name} due to filesystem error")
-                # Continue processing other samples even if this one failed
-            
-            # Clear batch from memory
-            del batch
-            del tensor
-            
-    except KeyboardInterrupt:
-        logger.info(f"{split_name}: Interrupted by user at {samples_collected} samples")
-    except Exception as e:
-        logger.error(f"{split_name}: Error during processing: {e}")
-        raise
-    
-    logger.info(f"{split_name}: Completed with {samples_collected} samples")
-    return samples_collected
+                filename = f"{tensor_idx:04d}.pt"
+                file_path = f"{subfolder_path}/{filename}"
+                if save_tensor(fs, tensor, file_path, frames_per_sample=frames_per_sample, crop_duration=crop_duration):
+                    samples_collected += 1
+                    samples_in_current_subfolder += 1
+                    if samples_collected % 100 == 0:
+                        queue_size = upload_queue.qsize()
+                        logger.info(f"{split_name}: {samples_collected}/{target_samples} samples collected (upload queue: {queue_size}/{MAX_QUEUE_SIZE})")
+                        gc.collect()
+                else:
+                    logger.error(f"Failed to save sample {samples_collected} for {split_name} due to filesystem error")
+                del batch
+                del tensor
+        except KeyboardInterrupt:
+            logger.info(f"{split_name}: Interrupted by user at {samples_collected} samples")
+        except Exception as e:
+            logger.error(f"{split_name}: Error during processing: {e}")
+            raise
+        logger.info(f"{split_name}: Completed with {samples_collected} samples")
+        return samples_collected
 
 
 @app.command()
@@ -354,17 +388,20 @@ def organize_dataset(
     test_samples: int = typer.Option(1000, help="Number of test samples"),
     valid_samples: int = typer.Option(1000, help="Number of validation samples"),
     train_samples: int = typer.Option(20000, help="Number of training samples"),
+    train_from: int = typer.Option(0, help="Starting train sample number (inclusive)"),
+    train_to: int = typer.Option(20000, help="Ending train sample number (exclusive)"),
 ):
     """Organize video dataset into train/valid/test splits based on time ranges."""
     try:
         logger.info(f"Starting dataset organization to: {output_path}")
         logger.info(f"Target samples - test: {test_samples}, valid: {valid_samples}, train: {train_samples}")
+        logger.info(f"Train range: samples {train_from} to {train_to} (exclusive)")
         
         # Get filesystem
         fs = get_filesystem(output_path)
         
         # Create folder structure
-        create_folder_structure(fs, output_path)
+        create_folder_structure(fs, output_path, train_from, train_to)
         
         # Common loader kwargs
         loader_kwargs = {
@@ -390,6 +427,8 @@ def organize_dataset(
             target_samples=test_samples,
             base_path=output_path,
             fs=fs,
+            train_from=train_from,
+            train_to=train_to,
             **loader_kwargs
         )
         
@@ -404,6 +443,8 @@ def organize_dataset(
             target_samples=valid_samples,
             base_path=output_path,
             fs=fs,
+            train_from=train_from,
+            train_to=train_to,
             **loader_kwargs
         )
         
@@ -418,6 +459,8 @@ def organize_dataset(
             target_samples=train_samples,
             base_path=output_path,
             fs=fs,
+            train_from=train_from,
+            train_to=train_to,
             **loader_kwargs
         )
         
@@ -441,6 +484,74 @@ def organize_dataset(
         
     except Exception as e:
         logger.error(f"Error during dataset organization: {e}")
+        cleanup_upload_pool()
+        raise
+
+
+@app.command()
+def process_train_range(
+    output_path: str = typer.Option(..., help="Output path (local folder or s3://bucket/prefix)"),
+    bucket_name: str = typer.Option('cod-yt-playlist', help="S3 bucket name for input videos"),
+    prefix: str = typer.Option('', help="S3 prefix for input videos"),
+    frames_per_sample: int = typer.Option(101, help="Number of frames per sample"),
+    target_height: int = typer.Option(360, help="Target video height"),
+    target_width: int = typer.Option(640, help="Target video width"),
+    crop_duration: float = typer.Option(30.5, help="Duration of video crops in seconds"),
+    train_samples: int = typer.Option(20000, help="Number of training samples"),
+    train_from: int = typer.Option(..., help="Starting train sample number (inclusive)"),
+    train_to: int = typer.Option(..., help="Ending train sample number (exclusive)"),
+):
+    """Process only a specific range of train subfolders."""
+    try:
+        logger.info(f"Processing train samples {train_from} to {train_to} (exclusive)")
+        logger.info(f"Target train samples: {train_samples}")
+        
+        # Get filesystem
+        fs = get_filesystem(output_path)
+        
+        # Create folder structure for the specified range
+        create_folder_structure(fs, output_path, train_from, train_to)
+        
+        # Common loader kwargs
+        loader_kwargs = {
+            'bucket_name': bucket_name,
+            'prefix': prefix,
+            'frames_per_sample': frames_per_sample,
+            'target_height': target_height,
+            'target_width': target_width,
+            'crop_duration': crop_duration,
+        }
+        
+        # Process only train split for the specified range
+        logger.info("=" * 50)
+        logger.info("PROCESSING TRAIN SPLIT (SPECIFIED RANGE)")
+        logger.info("=" * 50)
+        
+        result = process_split(
+            split_name="train",
+            from_time=20 * 60,  # 1200s
+            to_time=None,       # end
+            target_samples=train_samples,
+            base_path=output_path,
+            fs=fs,
+            train_from=train_from,
+            train_to=train_to,
+            **loader_kwargs
+        )
+        
+        # Clean up upload pool
+        cleanup_upload_pool()
+        
+        # Log final results
+        logger.info("=" * 50)
+        logger.info("TRAIN RANGE PROCESSING COMPLETED")
+        logger.info("=" * 50)
+        logger.info(f"Train samples processed: {result}")
+        logger.info(f"Range: samples {train_from} to {train_to} (exclusive)")
+        logger.info(f"Dataset saved to: {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Error during train range processing: {e}")
         cleanup_upload_pool()
         raise
 
@@ -471,16 +582,19 @@ def test_setup(
 @app.command()
 def verify_structure(
     dataset_path: str = typer.Option(..., help="Path to verify structure"),
+    train_from: int = typer.Option(0, help="Starting train sample number (inclusive)"),
+    train_to: int = typer.Option(20000, help="Ending train sample number (exclusive)"),
 ):
     """Verify the created dataset structure."""
     
     fs = get_filesystem(dataset_path)
     
     logger.info(f"Verifying dataset structure at: {dataset_path}")
+    logger.info(f"Train range: subfolders {train_from} to {train_to} (exclusive)")
     
     # Expected structure
     expected_folders = ["test/0000", "valid/0000"]
-    for i in range(20):
+    for i in range(train_from, train_to):
         expected_folders.append(f"train/{i:04d}")
     
     for folder in expected_folders:
