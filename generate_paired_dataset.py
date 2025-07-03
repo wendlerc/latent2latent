@@ -33,8 +33,13 @@ from lat2lat.data.tensor_s3 import get_loader
 app = typer.Typer()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+def setup_logging(log_level: str = "INFO"):
+    """Setup logging with specified level."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
 
 def get_filesystem(url: str):
     """Get appropriate filesystem for URL."""
@@ -181,7 +186,7 @@ class WANDCAEProcessor:
         if sequence_length is None:
             sequence_length = self.sequence_length  # Use the actual sequence length!
         
-        logger.info(f"GPU {self.gpu_id}: Starting batch size determination with sequence_length={sequence_length}, height={height}, width={width}")
+        logger.debug(f"GPU {self.gpu_id}: Starting batch size determination with sequence_length={sequence_length}, height={height}, width={width}")
         
         # Clear any existing GPU memory first
         torch.cuda.empty_cache()
@@ -195,15 +200,12 @@ class WANDCAEProcessor:
         for attempt in range(max_attempts):
             try:
                 test_input = (torch.randn(batch_size, *test_shape[1:])*255).to(torch.uint8)
-                print(f"GPU {self.gpu_id}: TEST WAN input shape: {test_input.shape} type: {test_input.dtype}")
+                logger.debug(f"GPU {self.gpu_id}: Testing batch size {batch_size}")
                 with torch.no_grad():
                     x_wan, x_dcae = self.model.preprocess(test_input)
                     _ = self.model(x_wan.to(self.dtype).cuda(self.gpu_id), x_dcae.to(self.dtype).cuda(self.gpu_id))
                 del test_input, x_wan, x_dcae
                 torch.cuda.empty_cache()
-                
-                # If we get here, this batch size works
-                logger.info(f"GPU {self.gpu_id}: Batch size {batch_size} works, trying larger...")
                 
                 # Double the batch size every step
                 batch_size *= 2
@@ -224,6 +226,14 @@ class WANDCAEProcessor:
                 else:
                     logger.error(f"GPU {self.gpu_id}: Runtime error during batch size determination: {e}")
                     raise e
+            except Exception as e:
+                del test_input
+                torch.cuda.empty_cache()
+                logger.error(f"GPU {self.gpu_id}: Unexpected error during batch size determination: {e}")
+                # Use a very conservative batch size as fallback
+                self.batch_size = 1
+                logger.warning(f"GPU {self.gpu_id}: Using fallback batch size of 1")
+                return 1
         
         # If we reach here, use the last successful batch size
         optimal_batch_size = max(1, batch_size // 2)
@@ -246,9 +256,8 @@ class WANDCAEProcessor:
             
             # Create dataloader for this GPU
             logger.info(f"GPU {self.gpu_id}: Creating dataloader with batch_size={self.batch_size}")
-            print(f"GPU {self.gpu_id}: Creating dataloader with batch_size={self.batch_size}")
             loader = get_loader(self.batch_size, url=self.data_url, window_length=self.sequence_length)
-            logger.info(f"GPU {self.gpu_id}: Dataloader created successfully")
+            logger.debug(f"GPU {self.gpu_id}: Dataloader created successfully")
         except Exception as e:
             logger.error(f"GPU {self.gpu_id}: Failed to create dataloader: {e}")
             logger.error(f"GPU {self.gpu_id}: data_url={self.data_url}, batch_size={self.batch_size}")
@@ -263,22 +272,13 @@ class WANDCAEProcessor:
                     break
                 
                 try:
-                    # Debug batch information
-                    logger.info(f"GPU {self.gpu_id}: Processing batch {batch_idx}, batch type: {type(batch)}")
-                    if isinstance(batch, torch.Tensor):
-                        logger.info(f"GPU {self.gpu_id}: Batch shape: {batch.shape}, dtype: {batch.dtype}")
-                    else:
-                        logger.info(f"GPU {self.gpu_id}: Batch is not a tensor: {batch}")
-                    
-                    print(f"GPU {self.gpu_id}: Batch shape: {batch.shape}, dtype: {batch.dtype}")
                     # Process batch
                     with torch.no_grad():
                         # Process through model
                         try:
-                            logger.info(f"GPU {self.gpu_id}: Starting model preprocessing...")
                             video_batch = batch  # Already in correct shape [batch_size, sequence_length, channels, height, width]
                             x_wan, x_dcae = self.model.preprocess(video_batch)
-                            logger.info(f"GPU {self.gpu_id}: Preprocessing complete. WAN shape: {x_wan.shape if hasattr(x_wan, 'shape') else type(x_wan)}, DCAE shape: {x_dcae.shape if hasattr(x_dcae, 'shape') else type(x_dcae)}")
+                            logger.debug(f"GPU {self.gpu_id}: Preprocessing complete. WAN shape: {x_wan.shape}, DCAE shape: {x_dcae.shape}")
                         except Exception as e:
                             logger.error(f"GPU {self.gpu_id}: Error in model.preprocess(): {e}")
                             logger.error(f"GPU {self.gpu_id}: Input shape: {video_batch.shape}, dtype: {video_batch.dtype}")
@@ -287,21 +287,15 @@ class WANDCAEProcessor:
                             raise
                         
                         try:
-                            logger.info(f"GPU {self.gpu_id}: Starting model forward pass...")
-                            logger.error(f"GPU {self.gpu_id}: TEST WAN input shape: {x_wan.shape} type: {x_wan.dtype}")
-                            logger.error(f"GPU {self.gpu_id}: TEST DCAE input shape: {x_dcae.shape} type: {x_dcae.dtype}")
-                            
                             # Clear cache before forward pass
                             torch.cuda.empty_cache()
                             
                             mean_wan, mean_dcae = self.model(x_wan.cuda(self.gpu_id), x_dcae.cuda(self.gpu_id))
-                            logger.info(f"GPU {self.gpu_id}: Forward pass complete. WAN mean shape: {mean_wan.shape}, DCAE mean shape: {mean_dcae.shape}")
+                            logger.debug(f"GPU {self.gpu_id}: Forward pass complete. WAN mean shape: {mean_wan.shape}, DCAE mean shape: {mean_dcae.shape}")
                         except Exception as e:
                             logger.error(f"GPU {self.gpu_id}: Error in model forward pass: {e}")
                             logger.error(f"GPU {self.gpu_id}: WAN input shape: {x_wan.shape if hasattr(x_wan, 'shape') else type(x_wan)}")
                             logger.error(f"GPU {self.gpu_id}: DCAE input shape: {x_dcae.shape if hasattr(x_dcae, 'shape') else type(x_dcae)}")
-                            logger.error(f"GPU {self.gpu_id}: WAN input dtype: {x_wan.dtype if hasattr(x_wan, 'dtype') else type(x_wan)}")
-                            logger.error(f"GPU {self.gpu_id}: DCAE input dtype: {x_dcae.dtype if hasattr(x_dcae, 'dtype') else type(x_dcae)}")
                             import traceback
                             logger.error(f"GPU {self.gpu_id}: Forward pass traceback:\n{traceback.format_exc()}")
                             raise
@@ -310,7 +304,6 @@ class WANDCAEProcessor:
                         try:
                             mean_wan = mean_wan.cpu()
                             mean_dcae = mean_dcae.cpu()
-                            logger.info(f"GPU {self.gpu_id}: Moved results to CPU")
                         except Exception as e:
                             logger.error(f"GPU {self.gpu_id}: Failed to move results to CPU: {e}")
                             raise
@@ -318,7 +311,6 @@ class WANDCAEProcessor:
                         # Create samples
                         try:
                             batch_size = video_batch.shape[0]
-                            logger.info(f"GPU {self.gpu_id}: Creating {batch_size} samples...")
                             
                             for i in range(batch_size):
                                 sample = {
@@ -330,7 +322,7 @@ class WANDCAEProcessor:
                                 self._add_sample_to_shard(sample)
                                 total_processed += 1
                             
-                            logger.info(f"GPU {self.gpu_id}: Successfully created and added {batch_size} samples")
+                            logger.debug(f"GPU {self.gpu_id}: Successfully created and added {batch_size} samples")
                         except Exception as e:
                             logger.error(f"GPU {self.gpu_id}: Error creating samples: {e}")
                             logger.error(f"GPU {self.gpu_id}: mean_wan shape: {mean_wan.shape}, mean_dcae shape: {mean_dcae.shape}")
@@ -345,24 +337,30 @@ class WANDCAEProcessor:
                 except Exception as e:
                     logger.error(f"GPU {self.gpu_id}: Error processing batch {batch_idx}: {e}")
                     
-                    # If it's an OOM error, try with a smaller batch size
-                    if 'out of memory' in str(e).lower() and self.batch_size is not None and self.batch_size > 1:
-                        logger.warning(f"GPU {self.gpu_id}: OOM error, reducing batch size from {self.batch_size} to {max(1, self.batch_size - 1)}")
-                        self.batch_size = max(1, self.batch_size - 1)
-                        # Recreate dataloader with smaller batch size
-                        try:
-                            loader = get_loader(self.batch_size, url=self.data_url, window_length=self.sequence_length)
-                            logger.info(f"GPU {self.gpu_id}: Recreated dataloader with batch_size={self.batch_size}")
-                        except Exception as loader_error:
-                            logger.error(f"GPU {self.gpu_id}: Failed to recreate dataloader: {loader_error}")
+                    # If it's a CUDA OOM error, crash the processor
+                    if 'out of memory' in str(e).lower():
+                        logger.error(f"GPU {self.gpu_id}: CUDA OOM error - crashing processor")
+                        
+                        # Aggressive memory cleanup
+                        torch.cuda.empty_cache()
+                        
+                        # Write final shard if there are remaining samples
+                        if self.current_shard_samples:
+                            self._write_current_shard()
+                        
+                        # Force garbage collection
+                        import gc
+                        gc.collect()
+                        
+                        raise RuntimeError(f"GPU {self.gpu_id}: CUDA out of memory - processor crashed")
                     
-                    # Continue to next batch instead of failing completely
+                    # For other errors, continue to next batch
                     continue
                 
                 total_batches += 1
                 
-                # Log progress
-                if batch_idx % 10 == 0:
+                # Log progress less frequently
+                if batch_idx % 50 == 0:
                     current_size_mb = self.current_shard_size_bytes / 1024 / 1024
                     logger.info(f"GPU {self.gpu_id}: Processed {total_processed} samples in {total_batches} batches "
                                f"(current shard: {current_size_mb:.1f} MB)")
@@ -373,11 +371,17 @@ class WANDCAEProcessor:
             logger.error(f"GPU {self.gpu_id}: Fatal error during processing: {e}")
             import traceback
             logger.error(f"GPU {self.gpu_id}: Full traceback:\n{traceback.format_exc()}")
+            
+            # Write final shard if there are remaining samples
+            if self.current_shard_samples:
+                self._write_current_shard()
+            
+            # Re-raise the exception to crash the processor
             raise
-        
-        # Write final shard if there are remaining samples
-        if self.current_shard_samples:
-            self._write_current_shard()
+        finally:
+            # Write final shard if there are remaining samples
+            if self.current_shard_samples:
+                self._write_current_shard()
         
         return {
             'gpu_id': self.gpu_id,
@@ -400,8 +404,13 @@ def generate_dataset(
     num_workers: int = typer.Option(2, help="Number of dataloader workers per GPU"),
     max_samples: Optional[int] = typer.Option(None, help="Maximum number of samples to process per GPU"),
     compile: bool = typer.Option(False, help="Compile the model"),
+    log_level: str = typer.Option("INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)"),
 ):
     """Generate paired WAN/DCAE latent dataset using Ray for distributed processing."""
+    
+    # Setup logging with specified level
+    global logger
+    logger = setup_logging(log_level)
     
     # Initialize Ray
     if not ray.is_initialized():
@@ -431,10 +440,9 @@ def generate_dataset(
     
     # Start processing
     # Call get_max_batch_size with explicit parameters to ensure consistency
-    futures = [processor.get_max_batch_size.remote(sequence_length=sequence_length, height=360, width=640) for processor in processors]
-    batch_sizes = ray.get(futures)
-    print(f"Batch sizes: {batch_sizes}")
-    logger.info(f"Batch sizes: {batch_sizes}")
+    #futures = [processor.get_max_batch_size.remote(sequence_length=sequence_length, height=360, width=640) for processor in processors]
+    #batch_sizes = ray.get(futures)
+    #logger.info(f"Determined batch sizes: {batch_sizes}")
     # Start processing on all GPUs
     logger.info("Starting processing on all GPUs...")
     futures = [processor.process_dataset.remote(max_samples) for processor in processors]
