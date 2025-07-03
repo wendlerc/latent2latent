@@ -251,7 +251,7 @@ def collate_fn_tar(batch):
     dcae_slices = torch.stack(dcae_slices)  # [b,n,c,h,w]
     return wan_slices, dcae_slices
 
-def get_loader_tar(batch_size, url, **data_kwargs):
+def get_loader(batch_size, url, **data_kwargs):
     if dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -271,7 +271,7 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    loader = get_loader_tar(10, deterministic=True, prefetch_size=30, url="s3://cod-yt-latent-pairs/pairs/train2")
+    loader = get_loader(10, deterministic=True, prefetch_size=30, url="s3://cod-yt-latent-pairs/pairs/train2")
 
     start = time.time()
     wan, dcae = next(iter(loader))
