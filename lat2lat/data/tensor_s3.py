@@ -98,7 +98,7 @@ class S3CoDLatentDataset(IterableDataset):
         try:
             with self.fs.open(file_path, 'rb') as f:
                 tensor = torch.load(f)
-                logger.debug(f"Successfully loaded {file_path}, tensor shape: {tensor.shape}")
+                logger.info(f"Successfully loaded {file_path}, tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
                 return tensor
         except Exception as e:
             logger.error(f"Error loading file {file_path}: {e}")
@@ -130,7 +130,7 @@ class S3CoDLatentDataset(IterableDataset):
                         end_idx = start_idx + self.window
                         
                         # Extract window
-                        video_slice = tensor[start_idx:end_idx].float()
+                        video_slice = tensor[start_idx:end_idx]
                         samples.append(video_slice)
                 else:
                     logger.warning(f"Skipping {file_path} - insufficient frames ({num_frames} < {self.window})")
@@ -166,11 +166,9 @@ class S3CoDLatentDataset(IterableDataset):
                 
                 # Add samples to queue
                 for sample in samples:
-                    if len(self.data_queue) < self.prefetch_size:
-                        self.data_queue.append(sample)
-                        self.samples_generated += 1
-                    else:
-                        logger.warning(f"Queue full, dropping sample from {file_path}")
+                    self.data_queue.append(sample)
+                    self.samples_generated += 1
+                    
                 
                 queue_size = len(self.data_queue)
                 logger.info(f"Processed {file_path} in {process_time:.2f}s, generated {len(samples)} samples, queue size: {queue_size}/{self.prefetch_size}")
@@ -273,8 +271,6 @@ if __name__ == "__main__":
     print(f"Time to load second batch: {second_time:.2f}s")
     print(f"Video shape: {videos.shape}")
     print(f"Video dtype: {videos.dtype}")
-    print(f"Video range: [{videos.min():.3f}, {videos.max():.3f}]")
-    print(f"Video std: {videos.std():.3f}")
     
     # Get final debug stats
     try:
