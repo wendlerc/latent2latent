@@ -79,7 +79,7 @@ class LatentTranslatorTrainer(LightningModule):
         self.log_every_n_steps = log_every_n_steps
         self.scheduler = None
         self.optimizer = None
-        self.automatic_optimization = False
+        self.automatic_optimization = True
         self.gradient_clip_val = gradient_clip_val
         self.use_ema = use_ema
         self.ema_decay = ema_decay
@@ -118,19 +118,16 @@ class LatentTranslatorTrainer(LightningModule):
 
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_wan, wan)
+        print(f"Loss: {loss.item()}")
         
         # Log metrics
         self.log('epoch', float(self.current_epoch), on_step=True, on_epoch=True)
         self.log('loss', loss.item(), on_step=True, on_epoch=True)
-        self.log('lr-adamw', self.adamw.param_groups[0]['lr'], on_step=True, on_epoch=True)
-        
-        self.manual_backward(loss)
-        # Log gradient norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
-        self.log("grad_norm", grad_norm)
-        
-        self.adamw.step()
-        self.adamw.zero_grad()
+        optimizer = self.optimizers()
+        if isinstance(optimizer, list):
+            self.log('lr-adamw', optimizer[0].param_groups[0]['lr'], on_step=True, on_epoch=True)
+        else:
+            self.log('lr-adamw', optimizer.param_groups[0]['lr'], on_step=True, on_epoch=True)
         
         # Update EMA after optimizer step if enabled
         if self.use_ema:
@@ -157,7 +154,7 @@ class LatentTranslatorTrainer(LightningModule):
                 }
             }
         else:
-            return self.adamw
+            return [self.adamw]
 
     def train_dataloader(self):
         return get_loader(self.batch_size, deterministic=False, prefetch_size=30, url=self.train_url)
