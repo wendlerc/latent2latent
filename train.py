@@ -113,13 +113,8 @@ class LatentTranslatorTrainer(LightningModule):
 
     def training_step(self, batch, batch_idx):            
         wan, dcae = batch
-        print(f"WAN shape: {wan.shape}")
-        print(f"DCAE shape: {dcae.shape}")
         # Forward pass
         predicted_wan = self(dcae)
-
-        print(f"Predicted WAN shape: {predicted_wan.shape}")
-        print(f"Target WAN shape: {wan.shape}")
 
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_wan, wan)
@@ -198,6 +193,9 @@ def main(args: Namespace) -> None:
                                 config=vars(args),
                                 name=args.experiment_name)
         run_name = wandb_logger.experiment.name
+
+        # Watch model weights with wandb
+        wandb.watch(model.model, log="all", log_freq=args.log_every_n_steps)
 
         # Configure the ModelCheckpoint callback
         checkpoint_callback = ModelCheckpoint(
