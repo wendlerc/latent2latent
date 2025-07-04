@@ -115,9 +115,14 @@ class LatentTranslatorTrainer(LightningModule):
         return self.model.translate_batch(x)
 
     def training_step(self, batch, batch_idx):            
-        dcae, wan = batch
+        wan, dcae = batch
+        print(f"WAN shape: {wan.shape}")
+        print(f"DCAE shape: {dcae.shape}")
         # Forward pass
         predicted_wan = self(dcae)
+
+        print(f"Predicted WAN shape: {predicted_wan.shape}")
+        print(f"Target WAN shape: {wan.shape}")
 
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_wan, wan)
@@ -126,21 +131,15 @@ class LatentTranslatorTrainer(LightningModule):
         self.log('epoch', float(self.current_epoch), on_step=True, on_epoch=True)
         self.log('loss', loss.item(), on_step=True, on_epoch=True)
         self.log('lr-adamw', self.adamw.param_groups[0]['lr'], on_step=True, on_epoch=True)
-        self.log('lr-muon', self.muon.param_groups[0]['lr'], on_step=True, on_epoch=True)
         
         self.manual_backward(loss)
         # Log gradient norm
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
         self.log("grad_norm", grad_norm)
-        self.muon.step()
-        self.muon.zero_grad()
-        optimizers = self.optimizers()
-        if isinstance(optimizers, list):
-            optimizers[0].step()
-            optimizers[0].zero_grad()
-        else:
-            optimizers.step()
-            optimizers.zero_grad()
+        
+        # Use only AdamW optimizer to avoid Muon shape issues
+        self.adamw.step()
+        self.adamw.zero_grad()
         
         # Update EMA after optimizer step if enabled
         if self.use_ema:
@@ -151,18 +150,12 @@ class LatentTranslatorTrainer(LightningModule):
      
     def configure_optimizers(self):
         lr_adamw = self.lr_adamw
-        lr_muon = self.lr_muon
         b1 = self.b1
         b2 = self.b2
         weight_decay = self.weight_decay
 
-        # Find ≥2D parameters in the body of the network -- these should be optimized by Muon
-        muon_params = [p for p in self.model.parameters() if p.ndim >= 2]
-        # Find everything else -- these should be optimized by AdamW
-        adamw_params = [p for p in self.model.parameters() if p.ndim < 2]
-        # Create the optimizer
-        self.muon = Muon(muon_params, lr=lr_muon, momentum=0.95)
-        self.adamw = torch.optim.AdamW(adamw_params, lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
+        # Use only AdamW for all parameters to avoid Muon shape issues
+        self.adamw = torch.optim.AdamW(self.model.parameters(), lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
         
         if self.cosine_scheduler:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.adamw, T_max=self.max_steps)
@@ -278,4 +271,4 @@ if __name__ == '__main__':
     
     hparams = parser.parse_args()
 
-    main(hparams)
+    main(hparams) 
