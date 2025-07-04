@@ -41,7 +41,7 @@ class LatentPairs(IterableDataset):
                  deterministic=True,
                  prefetch_size=100,
                  loop_forever=False,
-                 file_share_max=20):
+                 file_share_max=1):
         super().__init__()
         self.rank = rank
         self.world_size = world_size
@@ -167,6 +167,7 @@ class LatentPairs(IterableDataset):
         while True:
             if len(self.data_queue.items) < self.max_data:
                 tar_data = self.tar_queue.pop()
+                self.tars_processed += 1
                 if tar_data is None:
                     time.sleep(0.1)
                     continue
@@ -229,7 +230,7 @@ class LatentPairs(IterableDataset):
                 if empty_queue_count % 100 == 0:  # Log every 100 empty checks
                     logger.warning(f"Queue empty for {empty_queue_count} consecutive checks, waiting...")
                 # If no data available, wait a bit
-                time.sleep(0.1)
+                time.sleep(0.5)
 
     def get_debug_stats(self):
         """Get current debug statistics"""

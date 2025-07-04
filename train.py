@@ -118,7 +118,6 @@ class LatentTranslatorTrainer(LightningModule):
 
         # Calculate loss (MSE)
         loss = F.mse_loss(predicted_wan, wan)
-        print(f"Loss: {loss.item()}")
         
         # Log metrics
         self.log('epoch', float(self.current_epoch), on_step=True, on_epoch=True)
@@ -157,7 +156,7 @@ class LatentTranslatorTrainer(LightningModule):
             return [self.adamw]
 
     def train_dataloader(self):
-        return get_loader(self.batch_size, deterministic=False, prefetch_size=30, url=self.train_url)
+        return get_loader(self.batch_size, deterministic=False, prefetch_size=100, url=self.train_url)
     
 
 def main(args: Namespace) -> None:
@@ -244,7 +243,7 @@ if __name__ == '__main__':
     
     # checkpoint and logging parameters
     parser.add_argument("--checkpoint_path", type=str, default="models/latent_translator")
-    parser.add_argument("--log_every_n_steps", type=int, default=100)
+    parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--checkpoint_every_n_examples", type=int, default=100000)
     parser.add_argument("--checkpoint_top_k", type=int, default=5)
     
