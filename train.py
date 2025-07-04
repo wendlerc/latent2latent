@@ -219,7 +219,7 @@ if __name__ == '__main__':
     parser.add_argument("--input_channels", type=int, default=128, help="number of input channels")
     parser.add_argument("--output_channels", type=int, default=16, help="number of output channels")
     parser.add_argument("--input_size", type=int, default=4, help="input size")
-    parser.add_argument("--output_size", type=int, default=16, help="output size")
+    parser.add_argument("--output_size", type=int, default=64, help="output size")
     
     # data parameters
     parser.add_argument("--train_url", type=str, default='s3://cod-yt-latent-pairs/pairs/train2')
@@ -227,7 +227,7 @@ if __name__ == '__main__':
     # training parameters
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--cosine_scheduler", default=False, action="store_true")
-    parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=16, help="size of the batches")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=10, help="number of epochs of training")
     parser.add_argument("--max_steps", type=int, default=500, help="number of steps of training")
