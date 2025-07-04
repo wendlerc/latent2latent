@@ -147,6 +147,7 @@ class LatentPairs(IterableDataset):
                     if not self.deterministic:
                         random.shuffle(self.tar_paths)
                     tar_index = 0
+                    self.tars_processed = 0
             else:
                 time.sleep(0.1)
 

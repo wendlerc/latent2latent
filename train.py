@@ -156,7 +156,7 @@ class LatentTranslatorTrainer(LightningModule):
             return [self.adamw]
 
     def train_dataloader(self):
-        return get_loader(self.batch_size, deterministic=False, prefetch_size=100, url=self.train_url)
+        return get_loader(self.batch_size, loop_forever=True, deterministic=False, prefetch_size=100, url=self.train_url)
     
 
 def main(args: Namespace) -> None:
@@ -219,18 +219,18 @@ if __name__ == '__main__':
     parser.add_argument("--input_channels", type=int, default=128, help="number of input channels")
     parser.add_argument("--output_channels", type=int, default=16, help="number of output channels")
     parser.add_argument("--input_size", type=int, default=4, help="input size")
-    parser.add_argument("--output_size", type=int, default=64, help="output size")
+    parser.add_argument("--output_size", type=int, default=16, help="output size")
     
     # data parameters
     parser.add_argument("--train_url", type=str, default='s3://cod-yt-latent-pairs/pairs/train2')
     
     # training parameters
-    parser.add_argument("--gradient_clip_val", type=float, default=0.0)
+    parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--cosine_scheduler", default=False, action="store_true")
     parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=10, help="number of epochs of training")
-    parser.add_argument("--max_steps", type=int, default=-1, help="number of steps of training")
+    parser.add_argument("--max_steps", type=int, default=500, help="number of steps of training")
     parser.add_argument("--lr_adamw", type=float, default=0.0002, help="adam: learning rate")
     parser.add_argument("--b1", type=float, default=0.5,
                         help="adam: decay of first order momentum of gradient")
@@ -244,7 +244,7 @@ if __name__ == '__main__':
     # checkpoint and logging parameters
     parser.add_argument("--checkpoint_path", type=str, default="models/latent_translator")
     parser.add_argument("--log_every_n_steps", type=int, default=10)
-    parser.add_argument("--checkpoint_every_n_examples", type=int, default=100000)
+    parser.add_argument("--checkpoint_every_n_examples", type=int, default=100)
     parser.add_argument("--checkpoint_top_k", type=int, default=5)
     
     # hardware parameters
