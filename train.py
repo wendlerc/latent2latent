@@ -22,7 +22,6 @@ import logging
 import wandb
 import json
 
-from muon import Muon
 from torch import nn
 
 from ema_pytorch import EMA
@@ -39,7 +38,6 @@ class LatentTranslatorTrainer(LightningModule):
                  input_size: int = 4,
                  output_size: int = 64,
                  lr_adamw: float = 0.0002,
-                 lr_muon: float = 0.02,
                  b1: float = 0.5,
                  b2: float = 0.999,
                  weight_decay: float = 0,
@@ -73,7 +71,6 @@ class LatentTranslatorTrainer(LightningModule):
         if self.datapoints_per_epoch is not None and self.max_epochs is not None:
             self.max_steps = self.max_epochs * self.datapoints_per_epoch // self.batch_size 
         self.lr_adamw = lr_adamw
-        self.lr_muon = lr_muon
         self.b1 = b1
         self.b2 = b2
         self.weight_decay = weight_decay
@@ -137,7 +134,6 @@ class LatentTranslatorTrainer(LightningModule):
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.gradient_clip_val, norm_type=2)
         self.log("grad_norm", grad_norm)
         
-        # Use only AdamW optimizer to avoid Muon shape issues
         self.adamw.step()
         self.adamw.zero_grad()
         
@@ -154,7 +150,6 @@ class LatentTranslatorTrainer(LightningModule):
         b2 = self.b2
         weight_decay = self.weight_decay
 
-        # Use only AdamW for all parameters to avoid Muon shape issues
         self.adamw = torch.optim.AdamW(self.model.parameters(), lr=lr_adamw, betas=(b1, b2), weight_decay=weight_decay)
         
         if self.cosine_scheduler:
@@ -243,7 +238,6 @@ if __name__ == '__main__':
     parser.add_argument("--max_epochs", type=int, default=10, help="number of epochs of training")
     parser.add_argument("--max_steps", type=int, default=-1, help="number of steps of training")
     parser.add_argument("--lr_adamw", type=float, default=0.0002, help="adam: learning rate")
-    parser.add_argument("--lr_muon", type=float, default=0.02, help="muon: learning rate")
     parser.add_argument("--b1", type=float, default=0.5,
                         help="adam: decay of first order momentum of gradient")
     parser.add_argument("--b2", type=float, default=0.999,
