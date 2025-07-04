@@ -56,7 +56,7 @@ class LatentTranslator(nn.Module):
             Output tensor of shape (batch, 1 + (n-1)//4, 16, 64, 64)
         """
         # Initial channel reduction
-        assert (x.shape[1] -1)%4 == 0, "Batch size -1 must be divisible by 4"
+        assert (x.shape[1] -1)%4 == 0, f"{x.shape} Batch size -1 must be divisible by 4"
         b, n, c, h, w = x.shape
         x_flat = x.reshape(b*n, c, h, w)
         x = self.conv_in(x_flat)
@@ -79,7 +79,7 @@ class LatentTranslator(nn.Module):
         Returns:
             Output tensor of shape (b, 26, 16, 64, 64)
         """
-        assert (x.shape[1] -1)%4 == 0, "Batch size -1 must be divisible by 4"
+        assert (x.shape[1] -1)%4 == 0, f"{x.shape} Batch size -1 must be divisible by 4"
         translated = self.forward(x)
         b, n, c, h, w = translated.shape
         helper = translated[:, 1:].reshape(b, (n-1)//4, 4, c, h, w)
