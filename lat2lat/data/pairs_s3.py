@@ -249,7 +249,7 @@ def collate_fn_tar(batch):
     wan_slices, dcae_slices = zip(*batch)
     wan_slices = torch.stack(wan_slices)    # [b,n,c,h,w]
     dcae_slices = torch.stack(dcae_slices)  # [b,n,c,h,w]
-    return wan_slices, dcae_slices
+    return dcae_slices, wan_slices
 
 def get_loader(batch_size, url, **data_kwargs):
     if dist.is_initialized():
