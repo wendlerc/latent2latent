@@ -22,16 +22,7 @@ class LearnableTemporalAggregation(nn.Module):
         self.channels = channels
         
         # Attention mechanism for temporal aggregation
-        self.temporal_attention = nn.Sequential(
-            nn.GroupNorm(8, channels),
-            nn.Conv2d(channels, channels // 4, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # Optional: learnable combination weights
-        self.combination_weights = nn.Parameter(torch.ones(group_size) / group_size)
+        self.temporal_attention = nn.Conv1d(channels, channels, kernel_size=group_size, stride=group_size)
         
     def forward(self, x):
         """
@@ -47,30 +38,11 @@ class LearnableTemporalAggregation(nn.Module):
         
         # Reshape remaining frames into groups
         remaining_frames = x[:, 1:]
-        remaining_frames = remaining_frames.reshape(b, (n-1)//self.group_size, self.group_size, c, h, w)
         
-        # Apply temporal attention within each group
-        # Reshape for attention computation: (b * num_groups, group_size, c, h, w)
-        grouped_frames = remaining_frames.reshape(b * (n-1)//self.group_size, self.group_size, c, h, w)
-        
-        # Compute attention weights for each frame in the group
-        attention_weights = []
-        for i in range(self.group_size):
-            frame_attention = self.temporal_attention(grouped_frames[:, i])  # (b*num_groups, 1, h, w)
-            attention_weights.append(frame_attention)
-        
-        attention_weights = torch.stack(attention_weights, dim=1)  # (b*num_groups, group_size, 1, h, w)
-        attention_weights = F.softmax(attention_weights, dim=1)
-        
-        # Combine learnable weights with attention
-        combo_weights = attention_weights * self.combination_weights.view(1, self.group_size, 1, 1, 1)
-        combo_weights = combo_weights / (combo_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # Apply weighted combination
-        aggregated = (grouped_frames * combo_weights).sum(dim=1)  # (b*num_groups, c, h, w)
-        aggregated = aggregated.reshape(b, (n-1)//self.group_size, c, h, w)
-        
-        return torch.cat([first_frame, aggregated], dim=1)
+        y = eo.rearrange(remaining_frames, 'b n c h w -> (b h w) c n')
+        y = self.temporal_attention(y)
+        y = eo.rearrange(y, '(b h w) c n1 -> b n1 c h w', b=b,c=c,h=h,w=w,n1=n//4)
+        return torch.cat([first_frame, y], dim=1)
 
 class LatentTranslator(nn.Module):
     """
@@ -135,7 +107,7 @@ class LatentTranslator(nn.Module):
         # Initial channel reduction
         assert (x.shape[1] -1)%4 == 0, f"{x.shape} Batch size -1 must be divisible by 4"
         b, n, c, h, w = x.shape
-        x_flat = x.reshape(b*n, c, h, w)
+        x_flat = eo.rearrange(x, 'b n c h w -> (b n) c h w')
         
         # Forward pass with normalization
         x = self.same_in(x_flat)
@@ -158,8 +130,8 @@ class LatentTranslator(nn.Module):
         
         # Final refinement with normalization
         x = self.final(x)
-        
-        return x.reshape(b, n, -1, self.output_size, self.output_size)
+        x = eo.rearrange(x, '(b n) c h w -> b n c h w', b=b,n=n)
+        return x
     
     def translate_batch(self, x):
         """
