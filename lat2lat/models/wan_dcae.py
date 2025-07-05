@@ -1,16 +1,21 @@
 import torch
-from torch import nn
+from torch import NoneType, nn
 import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 import sys
-sys.path.append('./owl-vaes')
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'owl-vaes'))
 from owl_vaes.configs import ResNetConfig
 from owl_vaes.models.dcae import DCAE, is_landscape
 import einops as eo
 
 
 class WANDCAEPair(nn.Module):
-    def __init__(self, dtype = torch.bfloat16, landscape_size = (360, 640), square_size = (512, 512)):
+    def __init__(self, dtype = torch.bfloat16, 
+                 landscape_size = (360, 640), 
+                 square_size = (512, 512),
+                 dcae_path = "/home/developer/workspace/models/cod_128x.pt",
+                 dcae_batch_size = None):
         super().__init__()
         vae = AutoencoderKLWan.from_pretrained(
             "Wan-AI/Wan2.1-VACE-14B-diffusers",
@@ -23,6 +28,7 @@ class WANDCAEPair(nn.Module):
         self.dtype = dtype
         self.landscape_size = landscape_size
         self.square_size = square_size
+        self.dcae_batch_size = dcae_batch_size
         cfg = ResNetConfig(
             sample_size=[360,640],
             channels=3,
@@ -52,7 +58,13 @@ class WANDCAEPair(nn.Module):
         b,t,c,h,w = x_dcae.shape
         x_dcae = eo.rearrange(x_dcae, 'b t c h w -> (b t) c h w')
         assert self.dcae.training == False, "dcae must be in eval mode, otherwise it returns mean, logvar"
-        mean_dcae = self.dcae.encoder(x_dcae)
+        if self.dcae_batch_size is not None:
+            mean_dcae = []
+            for i in range(0, len(x_dcae), self.dcae_batch_size):
+                mean_dcae.append(self.dcae.encoder(x_dcae[i:i+self.dcae_batch_size]))
+            mean_dcae = torch.cat(mean_dcae, dim=0)
+        else:
+            mean_dcae = self.dcae.encoder(x_dcae)
         mean_dcae = eo.rearrange(mean_dcae, '(b t) c h w -> b t c h w', b=b, t=t)
         del x_dcae
         mean_dcae = mean_dcae.cpu()

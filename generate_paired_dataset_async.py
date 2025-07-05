@@ -113,7 +113,7 @@ class WANDCAEProcessor:
     def __init__(self, gpu_id: int, data_url: str, output_path: str, batch_size = None, 
                  shard_size_mb: int = 100, sequence_length: int = 5, 
                  num_workers: int = 2, dtype_str: str = "bfloat16", compile: bool = False,
-                 log_collector: LogCollector = None):
+                 log_collector: LogCollector = None, start_from: int = 0):
         self.gpu_id = gpu_id
         self.data_url = data_url
         self.output_path = output_path
@@ -122,8 +122,9 @@ class WANDCAEProcessor:
         self.num_workers = num_workers
         self.dtype = getattr(torch, dtype_str)
         self.log_collector = log_collector
+        self.start_from = start_from
         # Shard tracking
-        self.current_shard_idx = 0
+        self.current_shard_idx = start_from//27 # hacky (specific to this exact dataset)
         self.current_folder_idx = 0
         self.max_tars_per_folder = 1000
         self.target_shard_size_bytes = shard_size_mb * 1024 * 1024
@@ -321,7 +322,7 @@ class WANDCAEProcessor:
             self.log_collector.log.remote(f"GPU {self.gpu_id}: batch_size={self.batch_size}")
             # Create dataloader for this GPU
             logger.info(f"GPU {self.gpu_id}: Creating dataloader with batch_size={self.batch_size}")
-            loader = get_loader(self.batch_size, url=self.data_url, window_length=self.sequence_length)
+            loader = get_loader(self.batch_size, url=self.data_url, window_length=self.sequence_length, start_from=self.start_from)
             logger.debug(f"GPU {self.gpu_id}: Dataloader created successfully")
         except Exception as e:
             logger.error(f"GPU {self.gpu_id}: Failed to create dataloader: {e}")
@@ -463,6 +464,7 @@ class WANDCAEProcessor:
 def generate_dataset(
     data_url: str = typer.Option(..., help="S3 URL containing video data"),
     output_path: str = typer.Option(..., help="Output path for generated dataset"),
+    start_from: int = typer.Option(0, help="Start from this file index"),
     num_gpus: int = typer.Option(1, help="Number of GPUs to use"),
     batch_size: int = typer.Option(None, help="Batch size per GPU"),
     sequence_length: int = typer.Option(5, help="Number of frames per sequence"),
@@ -500,6 +502,7 @@ def generate_dataset(
             data_url=data_url,
             output_path=output_path,
             batch_size=batch_size,
+            start_from=start_from,
             shard_size_mb=shard_size_mb,
             sequence_length=sequence_length,
             num_workers=num_workers,

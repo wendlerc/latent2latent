@@ -25,7 +25,8 @@ class S3CoDLatentDataset(IterableDataset):
                  world_size=1, 
                  deterministic=True,
                  prefetch_size=100,
-                 loop_forever=False):
+                 loop_forever=False,
+                 start_from=0):
         super().__init__()
         
         self.window = window_length
@@ -35,7 +36,7 @@ class S3CoDLatentDataset(IterableDataset):
         self.deterministic = deterministic
         self.prefetch_size = prefetch_size
         self.loop_forever = loop_forever
-
+        self.start_from = start_from
         # Setup fsspec filesystem
         self.fs = self._get_fs()
 
@@ -45,7 +46,7 @@ class S3CoDLatentDataset(IterableDataset):
         # Shuffle if not deterministic
         if not deterministic:
             random.shuffle(self.file_paths)
-        
+        self.file_paths = self.file_paths[start_from:]
         # Distribute files across ranks for distributed training
         self.file_paths = self.file_paths[rank::world_size]
         

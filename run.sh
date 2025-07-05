@@ -13,3 +13,4 @@ python generate_paired_dataset_async.py \
     --dtype bfloat16 \
     --num-workers 1 \
     --log-level INFO \
+    --start-from 1215
