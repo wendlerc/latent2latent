@@ -156,7 +156,7 @@ class LatentTranslatorTrainer(LightningModule):
             return [self.adamw]
 
     def train_dataloader(self):
-        return get_loader(self.batch_size, loop_forever=True, deterministic=False, prefetch_size=100, url=self.train_url)
+        return get_loader(self.batch_size, prefetch_tars=4, prefetch_data=4*self.batch_size, url=self.train_url)
     
 
 def main(args: Namespace) -> None:
@@ -200,6 +200,7 @@ def main(args: Namespace) -> None:
             verbose=True,  # If you want to see a message for each checkpoint
             every_n_train_steps=args.checkpoint_every_n_examples//(args.batch_size * trainer.world_size)+1,
             monitor='loss',
+            mode='min',
         )
         lr_monitor = LearningRateMonitor(logging_interval='step')
         trainer.callbacks.append(checkpoint_callback)
@@ -230,7 +231,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=16, help="size of the batches")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_epochs", type=int, default=10, help="number of epochs of training")
-    parser.add_argument("--max_steps", type=int, default=500, help="number of steps of training")
+    parser.add_argument("--max_steps", type=int, default=16*500, help="number of steps of training")
     parser.add_argument("--lr_adamw", type=float, default=0.0002, help="adam: learning rate")
     parser.add_argument("--b1", type=float, default=0.5,
                         help="adam: decay of first order momentum of gradient")
