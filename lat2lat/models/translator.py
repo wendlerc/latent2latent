@@ -47,7 +47,7 @@ class LatentTranslator(nn.Module):
         self.stage4 = UpBlock(3*input_channels//16, output_channels, num_res=2, total_blocks=6)
         
         # Final refinement with SameBlock
-        self.final = SameBlock(output_channels, output_channels, num_res=2, total_blocks=6)
+        self.final = weight_norm(nn.Conv2d(output_channels, output_channels, kernel_size=3, stride=1, padding=1))
         
     def forward(self, x):
         """
