@@ -1,3 +1,4 @@
+from tkinter.constants import NONE
 import fsspec
 import threading
 from dotenv import load_dotenv
@@ -37,23 +38,23 @@ class LatentPairs(IterableDataset):
     def __init__(self, 
                  url,
                  rank=0, 
-                 world_size=1, 
-                 deterministic=True,
-                 prefetch_size=100,
-                 loop_forever=False,
-                 file_share_max=1):
+                 world_size=1,
+                 window_size=5, 
+                 prefetch_tars=5,# how many files to prefetch
+                 prefetch_data=1000,
+                 max_data=None,
+                 loop_forever=False):
         super().__init__()
+        assert (window_size-1)%4 == 0, "window_size must be of the form 4k+1"
+        self.window_size = window_size
         self.rank = rank
         self.world_size = world_size
         self.url = url
-        self.deterministic = deterministic
-        self.prefetch_size = prefetch_size
-        self.loop_forever = loop_forever
-        self.file_share_max = file_share_max
+        self.prefetch_tars = prefetch_tars
+        self.prefetch_data = prefetch_data
+        self.max_data = max_data
 
-        # Queue parameters
-        self.max_tars = 2
-        self.max_data = prefetch_size
+        self.loop_forever = loop_forever
 
         # Initialize queues
         self.tar_queue = RandomizedQueue()
@@ -65,16 +66,14 @@ class LatentPairs(IterableDataset):
         # Get all tar file paths using glob
         self.tar_paths = self._get_all_tar_paths()
         
-        # Shuffle if not deterministic
-        if not deterministic:
-            random.shuffle(self.tar_paths)
-        
         # Distribute files across ranks for distributed training
         self.tar_paths = self.tar_paths[rank::world_size]
+        # random shuffle
+        random.shuffle(self.tar_paths)
+
         
         # Debug counters
         self.tars_processed = 0
-        self.samples_generated = 0
         self.samples_yielded = 0
         
         # Start background threads
@@ -83,7 +82,7 @@ class LatentPairs(IterableDataset):
         self.tar_thread.start()
         self.data_thread.start()
         
-        logger.info(f"Rank {rank}: Found {len(self.tar_paths)} tar files, prefetch_size={prefetch_size}")
+        logger.info(f"Rank {rank}: Found {len(self.tar_paths)} tar files, prefetch_tars={prefetch_tars}, prefetch_data={prefetch_data}")
 
     def _get_fs(self):
         kwargs = {
@@ -108,8 +107,6 @@ class LatentPairs(IterableDataset):
             
             # Convert to full paths and sort
             full_paths = sorted([f"s3://{file}" for file in tar_files])
-            if not self.deterministic:
-                random.shuffle(full_paths)
             logger.info(f"Found {len(full_paths)} .tar files in bucket")
             return full_paths
             
@@ -123,7 +120,7 @@ class LatentPairs(IterableDataset):
         
         while True:
             # Check if we need more tars
-            if len(self.tar_queue.items) < self.max_tars:
+            if len(self.tar_queue.items) < self.prefetch_tars and len(self.data_queue.items) < self.prefetch_data:
                 if tar_index < len(self.tar_paths):
                     tar_path = self.tar_paths[tar_index]
                     logger.info(f"Prefetching tar {tar_index + 1}/{len(self.tar_paths)}: {tar_path}")
@@ -144,12 +141,11 @@ class LatentPairs(IterableDataset):
                         break
                     # If we've processed all files, restart from beginning
                     logger.info(f"Completed downloading all {len(self.tar_paths)} tar files, restarting from beginning")
-                    if not self.deterministic:
-                        random.shuffle(self.tar_paths)
+                    random.shuffle(self.tar_paths)
                     tar_index = 0
                     self.tars_processed = 0
             else:
-                time.sleep(0.1)
+                time.sleep(0.3)
 
     def _process_tensor_file(self, tar, base_name: str, suffix: str) -> Optional[torch.Tensor]:
         """Extract and load a tensor file from tar"""
@@ -166,12 +162,12 @@ class LatentPairs(IterableDataset):
     def _process_data_worker(self):
         """Background thread to process tar data and extract samples"""
         while True:
-            if len(self.data_queue.items) < self.max_data:
+            if len(self.data_queue.items) < self.prefetch_data:
                 tar_data = self.tar_queue.pop()
-                self.tars_processed += 1
                 if tar_data is None:
                     time.sleep(0.1)
                     continue
+                self.tars_processed += 1
 
                 try:
                     tar_file = io.BytesIO(tar_data)
@@ -190,13 +186,16 @@ class LatentPairs(IterableDataset):
                             dcae_tensor = self._process_tensor_file(tar, base_name, "dcae")
 
                             if wan_tensor is not None and dcae_tensor is not None:
-                                
-                                # Sample multiple times if requested
-                                for _ in range(self.file_share_max):
-                                    if len(self.data_queue.items) >= self.max_data:
-                                        break
-                                    
-                                    self.data_queue.add((dcae_tensor, wan_tensor))
+                                # chunk dcae into windows of size self.window_size 
+                                # chunk wan into windows of size 1 + self.window_size//4
+                                dcae_chunks = []
+                                wan_chunks = []
+                                for i in range(0, dcae_tensor.shape[0], self.window_size):
+                                    dcae_chunks.append(dcae_tensor[i:i+self.window_size])
+                                for i in range(0, wan_tensor.shape[0], 1 + self.window_size//4):
+                                    wan_chunks.append(wan_tensor[i:i+1 + self.window_size//4])
+                                for dcae_chunk, wan_chunk in zip(dcae_chunks, wan_chunks):
+                                    self.data_queue.add((dcae_chunk, wan_chunk))
 
                 except Exception as e:
                     logger.error(f"Error processing tar: {e}")
@@ -216,7 +215,7 @@ class LatentPairs(IterableDataset):
                     queue_size = len(self.data_queue.items)
                     
                     if self.samples_yielded % 100 == 0:  # Log every 100 samples
-                        logger.info(f"Yielded {self.samples_yielded} samples, queue size: {queue_size}/{self.max_data}")
+                        logger.info(f"Yielded {self.samples_yielded} samples, queue size: {queue_size}/{self.prefetch_data}")
                     
                     yield sample
                     empty_queue_count = 0  # Reset counter
@@ -224,9 +223,13 @@ class LatentPairs(IterableDataset):
                     empty_queue_count += 1
             else:
                 # If not looping forever and all tars processed, break
-                if not self.loop_forever and self.tars_processed >= len(self.tar_paths):
-                    logger.info("No more data to yield and loop_forever is False. Ending iteration.")
-                    break
+                if not self.loop_forever:
+                    if self.tars_processed >= len(self.tar_paths) or (self.max_data is not None and self.samples_yielded >= self.max_data):
+                        logger.info("No more data to yield and loop_forever is False. Ending iteration.")
+                        break
+                    else:
+                        logger.info(f"No more data to yield and loop_forever is True. Waiting for more data...")
+                        time.sleep(0.5)
                 empty_queue_count += 1
                 if empty_queue_count % 100 == 0:  # Log every 100 empty checks
                     logger.warning(f"Queue empty for {empty_queue_count} consecutive checks, waiting...")
@@ -237,7 +240,6 @@ class LatentPairs(IterableDataset):
         """Get current debug statistics"""
         return {
             'tars_processed': self.tars_processed,
-            'samples_generated': self.samples_generated,
             'samples_yielded': self.samples_yielded,
             'queue_size': len(self.data_queue.items),
             'queue_capacity': self.max_data,
@@ -273,7 +275,7 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    loader = get_loader(10, deterministic=True, prefetch_size=30, url="s3://cod-yt-latent-pairs/pairs/train2")
+    loader = get_loader(10, prefetch_tars=2, prefetch_data=100, url="s3://cod-yt-latent-pairs/pairs/train2", window_size=5)
 
     start = time.time()
     wan, dcae = next(iter(loader))
@@ -298,6 +300,8 @@ if __name__ == "__main__":
     print(f"WAN dtype: {wan.dtype}")
     print(f"DCAE shape: {dcae.shape}")
     print(f"DCAE dtype: {dcae.dtype}")
+    print(f"First time: {first_time}")
+    print(f"Second time: {second_time}")
     
     # Get final debug stats
     try:
