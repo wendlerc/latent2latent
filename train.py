@@ -27,7 +27,7 @@ from torch import nn
 from ema_pytorch import EMA
 
 # Import the translator model
-from lat2lat.models.translator import LatentTranslator, dca_to_wan_temporal
+from lat2lat.models.translatorv2 import LatentTranslator
 from lat2lat.data.pairs_s3 import get_loader
 
 
@@ -132,8 +132,9 @@ class LatentTranslatorTrainer(LightningModule):
         if self.use_ema:
             self.ema.update()
             with torch.no_grad():
-                pred_ema_wan = self.ema.forward_eval(dcae)
-                pred_ema_wan = dca_to_wan_temporal(pred_ema_wan)
+                self.ema.model.eval()
+                pred_ema_wan = self.ema.model.translate_batch(dcae)
+                self.ema.model.train()
                 loss_ema = F.mse_loss(pred_ema_wan, wan)
                 self.log('loss-ema', loss_ema.item(), on_step=True, on_epoch=True, prog_bar=True)
         
