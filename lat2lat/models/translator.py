@@ -30,23 +30,24 @@ class LatentTranslator(nn.Module):
         self.upsample_factor = output_size // input_size  # 16
         
         # Initial channel reduction
-        self.conv_in = weight_norm(nn.Conv2d(input_channels, 64, 1, 1, 0))
+        self.same_in = SameBlock(input_channels, input_channels, num_res=2, total_blocks=6)
+        self.conv_in = weight_norm(nn.Conv2d(input_channels, input_channels//2, kernel_size=3, stride=1, padding=1))
         
         # Progressive upsampling using UpBlock pattern
         # Stage 1: 4x4 -> 8x8, channels: 64 -> 48
-        self.stage1 = UpBlock(64, 48, num_res=2, total_blocks=2)
+        self.stage1 = UpBlock(input_channels//2, 3*input_channels//8, num_res=2, total_blocks=6)
         
         # Stage 2: 8x8 -> 16x16, channels: 48 -> 32
-        self.stage2 = UpBlock(48, 32, num_res=2, total_blocks=2)
+        self.stage2 = UpBlock(3*input_channels//8, input_channels//4, num_res=2, total_blocks=6)
         
         # Stage 3: 16x16 -> 32x32, channels: 32 -> 24
-        self.stage3 = UpBlock(32, 24, num_res=2, total_blocks=2)
+        self.stage3 = UpBlock(input_channels//4, 3*input_channels//16, num_res=2, total_blocks=6)
 
         # Stage 4: 32x32 -> 64x64, channels: 24 -> 16
-        self.stage4 = UpBlock(24, 16, num_res=2, total_blocks=2)
+        self.stage4 = UpBlock(3*input_channels//16, output_channels, num_res=2, total_blocks=6)
         
         # Final refinement with SameBlock
-        self.final = SameBlock(output_channels, output_channels, num_res=1, total_blocks=2)
+        self.final = SameBlock(output_channels, output_channels, num_res=2, total_blocks=6)
         
     def forward(self, x):
         """
@@ -59,7 +60,8 @@ class LatentTranslator(nn.Module):
         assert (x.shape[1] -1)%4 == 0, f"{x.shape} Batch size -1 must be divisible by 4"
         b, n, c, h, w = x.shape
         x_flat = x.reshape(b*n, c, h, w)
-        x = self.conv_in(x_flat)
+        x = self.same_in(x_flat)
+        x = self.conv_in(x)
         # Progressive upsampling stages (3 stages instead of 4)
         x = self.stage1(x)  # 4x4 -> 8x8, 64 -> 32 channels
         x = self.stage2(x)  # 8x8 -> 16x16, 32 -> 16 channels
