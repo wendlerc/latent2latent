@@ -11,22 +11,6 @@ import os
 # Add the owl-vaes directory to the path
 from ..nn.resnet import SameBlock, UpBlock
 
-def dca_to_wan_temporal(prediction):
-    """
-    Translate a batch of latents from 101x128x4x4 to 26x16x64x64.
-    Treats the first dimension separately as suggested.
-    
-    Args:
-        x: Input tensor of shape (b, 101, 128, 4, 4)
-    Returns:
-        Output tensor of shape (b, 26, 16, 64, 64)
-    """
-    assert (prediction.shape[1] -1)%4 == 0, f"{prediction.shape} Batch size -1 must be divisible by 4"
-    b, n, c, h, w = prediction.shape
-    helper = prediction[:, 1:].reshape(b, (n-1)//4, 4, c, h, w)
-    reshaped = helper.mean(dim=2)
-    return torch.cat([prediction[:, 0:1], reshaped], dim=1)
-
 class LearnableTemporalAggregation(nn.Module):
     """
     Learnable temporal aggregation module that replaces simple averaging.
