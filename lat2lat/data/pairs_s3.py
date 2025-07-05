@@ -39,7 +39,7 @@ class LatentPairs(IterableDataset):
                  url,
                  rank=0, 
                  world_size=1,
-                 window_size=5, 
+                 window_size=5, # 101 would not chunk the data
                  prefetch_tars=5,# how many files to prefetch
                  prefetch_data=1000,
                  max_data=None,
